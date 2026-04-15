@@ -141,6 +141,11 @@ def main():
     p.add_argument("--fk-potential", type=str, default="difference",
                    choices=["immediate", "difference", "max", "sum"])
     p.add_argument("--fk-resample-interval", type=int, default=1)
+    p.add_argument("--fk-energy", type=str, default="zero",
+                   choices=["zero", "uma"],
+                   help="FK steering energy: 'zero' (uniform dummy) or 'uma' (UMA-s MLIP)")
+    p.add_argument("--fk-uma-model", type=str, default="uma-s-1p1",
+                   help="fairchem pretrained model id when --fk-energy=uma")
 
     p.add_argument("--num-samples", type=int, default=1,
                    help="K: number of random_site_heuristic_placement starts per system")
@@ -205,23 +210,27 @@ def main():
 
     flow_cfg = FlowConfig(sigma=model_cfg.sigma, eps=args.flow_eps)
 
-    fk_cfg: Optional[FKSteeringConfig] = None
+    # FK steering: energy model is loaded once and then rebound to each
+    # replicated batch inside the sampling loop via make_fk_energy_fn.
+    energy_model = None
     if args.fk_particles > 0:
-        def _zero_energy(x_pred: torch.Tensor, pad: torch.Tensor, mov: torch.Tensor) -> torch.Tensor:
-            return torch.zeros(x_pred.shape[0], device=x_pred.device, dtype=x_pred.dtype)
-        fk_cfg = FKSteeringConfig(
-            num_particles=args.fk_particles,
-            energy_fn=_zero_energy,
-            fk_lambda=args.fk_lambda,
-            resampling_interval=args.fk_resample_interval,
-            fk_start_time=args.fk_start_time,
-            potential_mode=args.fk_potential,
-        )
-        print(
-            "[fk] WARNING: FK steering enabled with zero-energy stub — plug in a "
-            "real energy function for meaningful particle resampling.",
-            flush=True,
-        )
+        if args.fk_energy == "uma":
+            from adsorbgen.energy import UMAEnergy  # noqa: WPS433
+            energy_model = UMAEnergy(
+                model_name=args.fk_uma_model,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                task_name="oc20",
+            )
+            print(
+                f"[fk] UMA energy ({args.fk_uma_model}, task=oc20) loaded for FK steering",
+                flush=True,
+            )
+        elif args.fk_energy == "zero":
+            print(
+                "[fk] WARNING: FK steering enabled with zero-energy stub — "
+                "pass --fk-energy uma for meaningful particle resampling.",
+                flush=True,
+            )
 
     def _replicate(batch: dict, P: int) -> dict:
         """Replicate every per-sample tensor P times along dim 0 for FK steering."""
@@ -248,9 +257,30 @@ def main():
 
         # For FK steering we must replicate the static context before calling
         # euler_sample; the sampler resamples indices within each P-group.
-        P = fk_cfg.num_particles if fk_cfg is not None else 1
+        P = args.fk_particles if args.fk_particles > 0 else 1
         work = _replicate(batch, P) if P > 1 else batch
         pos_gt_work = work["pos_relaxed"]
+
+        # Rebuild fk_cfg per batch so the energy closure captures the
+        # replicated atomic_numbers/cell for THIS batch.
+        fk_cfg: Optional[FKSteeringConfig] = None
+        if args.fk_particles > 0:
+            if args.fk_energy == "uma":
+                from adsorbgen.energy import make_fk_energy_fn  # noqa: WPS433
+                energy_fn = make_fk_energy_fn(
+                    energy_model, work["atomic_numbers"], work["cell"]
+                )
+            else:
+                def energy_fn(x_pred, pad, mov):  # zero stub
+                    return torch.zeros(x_pred.shape[0], device=x_pred.device, dtype=x_pred.dtype)
+            fk_cfg = FKSteeringConfig(
+                num_particles=args.fk_particles,
+                energy_fn=energy_fn,
+                fk_lambda=args.fk_lambda,
+                resampling_interval=args.fk_resample_interval,
+                fk_start_time=args.fk_start_time,
+                potential_mode=args.fk_potential,
+            )
 
         model_forward = _make_forward(model=model, batch=work)
 
@@ -337,6 +367,8 @@ def main():
                 "refine_final": args.refine_final,
                 "fk_particles": args.fk_particles,
                 "fk_potential": args.fk_potential if args.fk_particles > 0 else None,
+                "fk_energy": args.fk_energy if args.fk_particles > 0 else None,
+                "fk_uma_model": args.fk_uma_model if args.fk_particles > 0 and args.fk_energy == "uma" else None,
                 "num_placements": K,
                 "n_samples": len(all_records),
             },
