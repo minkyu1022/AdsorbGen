@@ -14,15 +14,24 @@ env/
 
 # Data / runs / logs (kept outside the repo)
 data/
+results/
 runs/
 logs/
 wandb/
 lightning_logs/
+node_modules/
+.next/
 *.lmdb
 *.lmdb-lock
 *.ckpt
 *.pt
 *.npz
+*.pkl
+*.pkl.*
+*.log
+*.out
+*.err
+*.cache
 
 # Editor / tooling
 .vscode/

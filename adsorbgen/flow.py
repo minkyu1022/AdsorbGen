@@ -1,31 +1,32 @@
-"""Euclidean flow matching in displacement space (x1-prediction).
+"""Flow matching on absolute coordinates (AtomMOF-style).
 
 Formulation:
-    delta_1  = minimum_image(x_relax - x_ref, cell)  on movable atoms (0 elsewhere)
-    delta_0  ~ N(0, sigma^2 I)
-    delta_t  = (1 - t) * delta_0 + t * delta_1             (linear path)
-    Loss     = || f_theta(delta_t, t, x_ref) - delta_1 ||^2 on movable atoms only
-    ODE step: delta_t += dt * (f_theta - delta_t) / (1 - t)
-    SDE step: delta_t += dt * (v + 0.5*g^2*score) + sqrt(g^2*dt) * noise,
-              with v = (f_theta - delta_t)/(1 - t),
-                   score = (t*v - delta_t)/(1 - t),
-                   g^2(t) = 0.5*(1 - t).
-    Output   = x_ref + delta_{t=1-eps} on movable atoms, x_ref elsewhere
+    x_0   = [surface: LMDB pos_init, ads: fairchem placement, bulk: pos_init]
+    x_1   = pos_relaxed (LMDB)
+    x_t   = (1 - t) * x_0 + t * x_1        (absolute coord interp)
+    Model: x_1_hat = f_theta(x_0, x_t, t)    (direct x_1 prediction)
+    Loss  = || x_1_hat - x_1 ||  on movable atoms only
+    ODE step: x_t += dt * (x_1_hat - x_t) / (1 - t)
+    SDE step: x_t += dt * (v + 0.5 g^2 s) + sqrt(g^2 dt) * noise,
+              with v = (x_1_hat - x_t)/(1-t),
+                   s = (t*v - (x_t - x_0)) / (1-t)  [approx. retained from prior formulation]
+                   g^2(t) = 0.5*(1-t).
 
-Optional sampler features (ported from AtomMOF):
-    - SDE coordinate update (`use_sde=True`)
-    - Final refinement step (`refine_final=True`): one extra forward at t=1-eps
-    - Feynman-Kac steering (`fk_steering=...`): particle resampling with an
-      energy callback during sampling.
+MIC is used only inside pair-feature construction in model.py to compute
+nearest-image distances; it is NEVER used in the loss or interpolation.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
+from ase.data import covalent_radii
+
+
+_COVALENT_RADII = torch.tensor(covalent_radii, dtype=torch.float32)
 
 
 def _assert_finite(t: torch.Tensor, name: str) -> None:
@@ -34,7 +35,10 @@ def _assert_finite(t: torch.Tensor, name: str) -> None:
 
 
 def minimum_image(delta: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
-    """Apply minimum-image convention to a Cartesian displacement."""
+    """Apply minimum-image convention to a Cartesian displacement.
+
+    Used by pair feature construction in model.py. Never in loss.
+    """
     _assert_finite(delta, "delta")
     _assert_finite(cell, "cell")
     cell_inv = torch.linalg.inv(cell)
@@ -43,59 +47,76 @@ def minimum_image(delta: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
     return torch.einsum("bnj,bjk->bnk", frac, cell)
 
 
-def compute_delta1(
-    pos: torch.Tensor,
-    pos_relaxed: torch.Tensor,
-    cell: torch.Tensor,
-    movable_mask: torch.Tensor,
-) -> torch.Tensor:
-    d = minimum_image(pos_relaxed - pos, cell)
-    return d * movable_mask.unsqueeze(-1).to(d.dtype)
-
-
 @dataclass
 class FlowConfig:
-    sigma: float = 0.5
-    eps: float = 1e-5  # avoid 1/(1-t) singularity at t=1 (and exact-zero noise at t=0)
+    eps: float = 1e-5  # avoid 1/(1-t) singularity
+    prediction_type: str = "x1"  # "x1" -> model predicts x_1; "v" -> model predicts v = x_1 - x_0
 
 
-def sample_t(batch_size: int, cfg: FlowConfig, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def _target_for_loss(prediction_type: str, pos_0: torch.Tensor,
+                     pos_1: torch.Tensor) -> torch.Tensor:
+    """Loss target: x_1 (default) or velocity v = x_1 - x_0 on every atom.
+    Non-movable atoms are filtered out by the loss masking, so the value
+    we put there does not matter.
+    """
+    if prediction_type == "v":
+        return pos_1 - pos_0
+    if prediction_type == "x1":
+        return pos_1
+    raise ValueError(f"Unknown prediction_type={prediction_type!r}")
+
+
+def flow_loss_split(
+    pred: torch.Tensor,
+    pos_0: torch.Tensor,
+    pos_1: torch.Tensor,
+    movable_mask: torch.Tensor,
+    tags: torch.Tensor,
+    loss_type: str = "l2",
+    prediction_type: str = "x1",
+) -> dict:
+    """Per-group loss against the prediction target picked by prediction_type."""
+    target = _target_for_loss(prediction_type, pos_0, pos_1)
+    return x1_loss_split(pred, target, movable_mask, tags, loss_type=loss_type)
+
+
+def sample_t(
+    batch_size: int, cfg: FlowConfig, device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     u = torch.rand(batch_size, device=device, dtype=dtype)
     return cfg.eps + (1 - 2 * cfg.eps) * u
 
 
-def sample_delta0(shape: Tuple[int, ...], cfg: FlowConfig, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    return torch.randn(*shape, device=device, dtype=dtype) * cfg.sigma
-
-
-def corrupt(
-    delta1: torch.Tensor,
+def interpolate_xt(
+    pos_0: torch.Tensor,
+    pos_1: torch.Tensor,
     t: torch.Tensor,
-    cfg: FlowConfig,
     movable_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    _assert_finite(delta1, "delta1")
-    B, N, _ = delta1.shape
-    delta0 = sample_delta0((B, N, 3), cfg, device=delta1.device, dtype=delta1.dtype)
-    delta0 = delta0 * movable_mask.unsqueeze(-1).to(delta0.dtype)
-    t_b = t.view(B, 1, 1).to(delta1.dtype)
-    delta_t = (1 - t_b) * delta0 + t_b * delta1
-    return delta_t, delta0
+) -> torch.Tensor:
+    """x_t = (1-t) * x_0 + t * x_1, only on movable atoms.
+
+    Non-movable atoms remain at pos_0 (their pos_1 is expected to equal pos_0).
+    """
+    _assert_finite(pos_0, "pos_0")
+    _assert_finite(pos_1, "pos_1")
+    B = pos_0.shape[0]
+    t_b = t.view(B, 1, 1).to(pos_0.dtype)
+    x_t = (1 - t_b) * pos_0 + t_b * pos_1
+    m = movable_mask.unsqueeze(-1).to(x_t.dtype)
+    x_t = m * x_t + (1 - m) * pos_0
+    return x_t
 
 
 def x1_loss(
     pred: torch.Tensor,
-    delta1: torch.Tensor,
+    pos_1: torch.Tensor,
     movable_mask: torch.Tensor,
     loss_type: str = "l2",
 ) -> torch.Tensor:
-    """Loss on movable atoms, averaged within sample then across batch.
-
-    Args:
-        loss_type: ``"l2"`` (MSE, default) or ``"l1"`` (MAE).
-    """
+    """|| pred - x_1 ||, averaged on movable atoms within sample then across batch."""
     _assert_finite(pred, "pred")
-    diff = pred - delta1
+    diff = pred - pos_1
     if loss_type == "l1":
         per_atom = diff.abs().sum(dim=-1)
     else:
@@ -106,52 +127,156 @@ def x1_loss(
     return per_sample.mean()
 
 
+def x1_loss_split(
+    pred: torch.Tensor,
+    pos_1: torch.Tensor,
+    movable_mask: torch.Tensor,
+    tags: torch.Tensor,
+    loss_type: str = "l2",
+) -> dict:
+    """Per-group loss breakdown (surface=tag 1, adsorbate=tag 2). Absolute x_1 target."""
+    _assert_finite(pred, "pred")
+    diff = pred - pos_1
+    if loss_type == "l1":
+        per_atom = diff.abs().sum(dim=-1)
+    else:
+        per_atom = diff.pow(2).sum(dim=-1)
+
+    def _group_loss(group_mask):
+        m = group_mask.to(per_atom.dtype)
+        denom = m.sum(dim=1)
+        has_any = denom > 0
+        denom = denom.clamp_min(1.0)
+        per_sample = (per_atom * m).sum(dim=1) / denom
+        if has_any.any():
+            return per_sample[has_any].mean()
+        return torch.tensor(0.0, device=per_atom.device, dtype=per_atom.dtype)
+
+    total_loss = _group_loss(movable_mask)
+    surf_mask = movable_mask & (tags == 1)
+    ads_mask = movable_mask & (tags == 2)
+    return {
+        "total": total_loss,
+        "surf": _group_loss(surf_mask),
+        "ads": _group_loss(ads_mask),
+    }
+
+
+def smooth_lddt_loss(
+    pred_coords: torch.Tensor,
+    true_coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+    cutoff: float = 15.0,
+    t: Optional[torch.Tensor] = None,
+    time_weight: float = 0.0,
+) -> torch.Tensor:
+    """Differentiable lDDT-style pair-distance loss over selected atoms.
+
+    Returns a scalar batch mean. Samples with fewer than two selected atoms
+    contribute zero, which keeps single-atom adsorbates well-defined.
+    """
+    _assert_finite(pred_coords, "pred_coords")
+    _assert_finite(true_coords, "true_coords")
+    true_dists = torch.cdist(true_coords, true_coords)
+    pred_dists = torch.cdist(pred_coords, pred_coords)
+
+    B, N, _ = true_coords.shape
+    pair_mask = (true_dists < float(cutoff)).to(pred_coords.dtype)
+    eye = torch.eye(N, device=pred_coords.device, dtype=pred_coords.dtype).unsqueeze(0)
+    pair_mask = pair_mask * (1.0 - eye)
+    m = atom_mask.to(pred_coords.dtype)
+    pair_mask = pair_mask * m.unsqueeze(1) * m.unsqueeze(2)
+
+    dist_diff = (true_dists - pred_dists).abs()
+    score = (
+        torch.sigmoid(0.5 - dist_diff)
+        + torch.sigmoid(1.0 - dist_diff)
+        + torch.sigmoid(2.0 - dist_diff)
+        + torch.sigmoid(4.0 - dist_diff)
+    ) * 0.25
+    denom = pair_mask.sum(dim=(1, 2)).clamp_min(1.0)
+    loss = 1.0 - (score * pair_mask).sum(dim=(1, 2)) / denom
+
+    valid = (atom_mask.sum(dim=1) >= 2).to(loss.dtype)
+    loss = loss * valid
+    if t is not None and float(time_weight) != 0.0:
+        t_flat = t.reshape(-1).to(loss.device, loss.dtype)
+        loss = loss * (1.0 + float(time_weight) * torch.relu(t_flat - 0.5))
+    return loss.mean()
+
+
+def adsorbate_pair_distance_losses(
+    pred_coords: torch.Tensor,
+    ref_coords: torch.Tensor,
+    atomic_numbers: torch.Tensor,
+    atom_mask: torch.Tensor,
+    bond_factor: float = 1.25,
+    clash_factor: float = 0.75,
+) -> dict:
+    """Adsorbate-internal distance auxiliaries against a reference geometry.
+
+    ``atom_mask`` selects adsorbate atoms. Bonded pairs are inferred from the
+    reference geometry with covalent-radius cutoffs, matching the connectivity
+    style used by anomaly detection more directly than a soft lDDT score.
+    """
+    _assert_finite(pred_coords, "pred_coords")
+    _assert_finite(ref_coords, "ref_coords")
+    pred_d = torch.cdist(pred_coords, pred_coords)
+    ref_d = torch.cdist(ref_coords, ref_coords)
+
+    B, N = atom_mask.shape
+    dtype = pred_coords.dtype
+    device = pred_coords.device
+
+    pair = atom_mask.unsqueeze(1) & atom_mask.unsqueeze(2)
+    upper = torch.triu(torch.ones(N, N, device=device, dtype=torch.bool), diagonal=1)
+    pair = pair & upper.unsqueeze(0)
+
+    radii = _COVALENT_RADII.to(device=device, dtype=dtype)
+    z = atomic_numbers.clamp(min=0, max=radii.numel() - 1)
+    r = radii[z]
+    cov_cut = (r.unsqueeze(1) + r.unsqueeze(2)) * float(bond_factor)
+    bonded = pair & (ref_d > 0.1) & (ref_d <= cov_cut)
+    nonbonded = pair & ~bonded
+
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        m = mask.to(values.dtype)
+        denom = m.sum(dim=(1, 2))
+        has_any = denom > 0
+        per_sample = (values * m).sum(dim=(1, 2)) / denom.clamp_min(1.0)
+        if has_any.any():
+            return per_sample[has_any].mean()
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+    dist_l1 = (pred_d - ref_d).abs()
+    min_nonbonded = (r.unsqueeze(1) + r.unsqueeze(2)) * float(clash_factor)
+    clash = torch.relu(min_nonbonded - pred_d).pow(2)
+
+    return {
+        "ads_pair_l1": _masked_mean(dist_l1, pair),
+        "ads_bond_l1": _masked_mean(dist_l1, bonded),
+        "ads_nonbonded_clash": _masked_mean(clash, nonbonded),
+    }
+
+
 def _score_from_velocity(
     v: torch.Tensor,
-    delta_t: torch.Tensor,
+    x_t: torch.Tensor,
+    pos_0: torch.Tensor,
     t_scalar: float,
     eps: float,
 ) -> torch.Tensor:
-    """Score of the marginal under the linear-path flow.
+    """Score for SDE path (absolute coordinates).
 
-    For delta_t = (1-t)*delta_0 + t*delta_1 with delta_0 ~ N(0, sigma^2 I),
-    one can show s(delta_t, t) = (t*v - delta_t) / (1 - t), where
-    v = E[(delta_1 - delta_t) / (1 - t)] is the conditional flow velocity.
-
-    Args:
-        v:        (B, N, 3) flow velocity (already masked to movable atoms).
-        delta_t:  (B, N, 3) current state.
-        t_scalar: scalar timestep in [0, 1).
-        eps:      regularizer for 1/(1 - t).
-
-    Returns:
-        (B, N, 3) score.
+    Uses the identity delta_t = x_t - x_0 with linear flow, so the same analytic
+    form (t*v - delta_t) / (1 - t) carries over.
     """
-    return (t_scalar * v - delta_t) / max(1.0 - float(t_scalar), eps)
+    return (t_scalar * v - (x_t - pos_0)) / max(1.0 - float(t_scalar), eps)
 
 
 @dataclass
 class FKSteeringConfig:
-    """Feynman-Kac particle steering during sampling.
-
-    The caller is responsible for replicating the static context (`pos`, `cell`,
-    `tags`, ...) by `num_particles` along the batch dim BEFORE invoking the
-    sampler. Resampling reorders within each particle group, so the static
-    context is unaffected.
-
-    Args:
-        num_particles: number of particles per original sample. The batch fed
-            to `euler_sample` must already have shape (orig_B * num_particles,
-            N, 3) — the sampler does not expand it for you.
-        energy_fn: callable mapping (x_pred, pad_mask, movable_mask) ->
-            (B,) energy tensor on the *predicted final* coordinates
-            x_pred = pos + pred_delta1. Lower is better.
-        fk_lambda: temperature for softmax on log weights.
-        resampling_interval: only resample every K Euler steps.
-        fk_start_time: only resample once t >= this value.
-        potential_mode: "immediate" | "difference" | "max" | "sum"
-            (matches AtomMOF semantics).
-    """
+    """Feynman-Kac particle steering during sampling."""
 
     num_particles: int
     energy_fn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
@@ -162,7 +287,6 @@ class FKSteeringConfig:
 
 
 def _fk_log_weights(energy_traj: torch.Tensor, mode: str) -> torch.Tensor:
-    """log G_t selector matching AtomMOF.sample()."""
     cur = energy_traj[:, -1]
     if mode == "immediate":
         return -cur
@@ -180,8 +304,7 @@ def _fk_log_weights(energy_traj: torch.Tensor, mode: str) -> torch.Tensor:
 @torch.no_grad()
 def euler_sample(
     model_forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    pos: torch.Tensor,
-    cell: torch.Tensor,
+    pos_0: torch.Tensor,
     movable_mask: torch.Tensor,
     pad_mask: torch.Tensor,
     cfg: FlowConfig,
@@ -191,43 +314,38 @@ def euler_sample(
     return_trajectory: bool = False,
     fk_steering: Optional[FKSteeringConfig] = None,
 ):
-    """Euler integrator for the x1-prediction flow in displacement space.
+    """Euler integrator on absolute coordinates (AtomMOF-style).
 
     Args:
-        model_forward: callable (delta_t, t) -> pred_delta1, closing over the
-            static context (pos, tags, ..., cell).
-        pos: (B, N, 3) Cartesian x_ref. Already replicated by num_particles if
-            FK steering is enabled.
-        cell, movable_mask, pad_mask: same batch dim as pos.
-        cfg: FlowConfig (sigma, eps).
+        model_forward: callable (x_t, t) -> pred_x_1. The caller closes over the
+            static context (pos_0, atomic_numbers, tags, cell, masks, ...).
+        pos_0: (B, N, 3) structured prior sample (x_0 absolute coords).
+        movable_mask: (B, N) bool; non-movable atoms stay frozen at pos_0.
+        pad_mask: (B, N) bool.
+        cfg: FlowConfig (eps).
         num_steps: number of Euler steps.
-        use_sde: if True, run the SDE update with g^2(t) = 0.5*(1-t).
-        refine_final: if True, perform one extra forward at t = 1 - eps and
-            use that prediction as the final delta_1.
-        return_trajectory: if True, also return the (num_steps+1+, B, N, 3)
-            stacked delta_t trajectory.
-        fk_steering: optional FKSteeringConfig (caller pre-replicated batch).
+        use_sde: add SDE noise term with g^2(t) = 0.5*(1-t).
+        refine_final: one extra forward at t=1-eps used as final x_1 prediction.
+        return_trajectory: return stacked x_t trajectory dict.
+        fk_steering: optional particle steering config.
 
     Returns:
-        x_out: (B, N, 3) final Cartesian coordinates = pos + delta_final on
-               movable atoms, pos elsewhere; padding atoms zeroed.
-        If return_trajectory: dict with keys
-            "x_out", "delta_trajectory" (T, B, N, 3),
-            "energy_trajectory" (B, history) if FK steering was active.
+        x_out: (B, N, 3) final absolute coords; non-movable at pos_0, padding zeroed.
+        If return_trajectory: dict.
     """
-    device = pos.device
-    dtype = pos.dtype
-    B, N, _ = pos.shape
+    device = pos_0.device
+    dtype = pos_0.dtype
+    B, N, _ = pos_0.shape
     movable_f = movable_mask.unsqueeze(-1).to(dtype)
     pad_f = pad_mask.unsqueeze(-1).to(dtype)
 
-    # Initialize delta_0 ~ N(0, sigma^2 I) on movable atoms.
-    delta_t = sample_delta0((B, N, 3), cfg, device=device, dtype=dtype)
-    delta_t = delta_t * movable_f
+    x_t = pos_0.clone()
+    x_t = x_t * pad_f
 
-    t_vals = torch.linspace(cfg.eps, 1.0 - cfg.eps, num_steps + 1, device=device, dtype=dtype)
+    t_vals = torch.linspace(cfg.eps, 1.0 - cfg.eps, num_steps + 1,
+                            device=device, dtype=dtype)
 
-    traj: List[torch.Tensor] = [delta_t.clone()] if return_trajectory else []
+    traj: List[torch.Tensor] = [x_t.clone()] if return_trajectory else []
     energy_traj: Optional[torch.Tensor] = None
     if fk_steering is not None:
         energy_traj = torch.empty((B, 0), device=device, dtype=dtype)
@@ -241,61 +359,76 @@ def euler_sample(
         dt = float((t_vals[i + 1] - t_vals[i]).item())
         t = t_vals[i].expand(B)
 
-        pred_delta1 = model_forward(delta_t, t)
-        pred_delta1 = pred_delta1 * movable_f
+        pred = model_forward(x_t, t)
 
-        # FK steering: evaluate energy of predicted final coords and resample.
-        if fk_steering is not None and t_scalar >= fk_steering.fk_start_time and (i % fk_steering.resampling_interval == 0):
-            x_pred = pos + pred_delta1
-            current_energy = fk_steering.energy_fn(x_pred, pad_mask, movable_mask).to(dtype)
+        if fk_steering is not None and t_scalar >= fk_steering.fk_start_time \
+                and (i % fk_steering.resampling_interval == 0):
+            # FK steering scores positions, so for v-pred we map to x_1 first.
+            if cfg.prediction_type == "v":
+                pred_x_1_for_fk = pos_0 + pred
+            else:
+                pred_x_1_for_fk = pred
+            current_energy = fk_steering.energy_fn(
+                pred_x_1_for_fk, pad_mask, movable_mask,
+            ).to(dtype)
             energy_traj = torch.cat([energy_traj, current_energy.unsqueeze(1)], dim=1)
 
             log_G = _fk_log_weights(energy_traj, fk_steering.potential_mode)
             P = fk_steering.num_particles
             log_G = log_G.reshape(-1, P)
             weights = F.softmax(log_G * fk_steering.fk_lambda, dim=1)
-            sampled = torch.multinomial(weights, P, replacement=True)  # (G, P)
+            sampled = torch.multinomial(weights, P, replacement=True)
             offset = torch.arange(weights.shape[0], device=device).unsqueeze(1) * P
             idx = (sampled + offset).flatten()
 
-            delta_t = delta_t[idx]
-            pred_delta1 = pred_delta1[idx]
+            x_t = x_t[idx]
+            pred = pred[idx]
             energy_traj = energy_traj[idx]
-            # Static context (pos/cell/tags/...) is identical within each
-            # particle group, so reordering inside a group is a no-op for it.
 
-        v = (pred_delta1 - delta_t) / max(1.0 - t_scalar, cfg.eps)
+        # Velocity on absolute coords:
+        #   x1-mode  -> v = (pred_x_1 - x_t) / (1-t)
+        #   v-mode   -> model directly outputs v = x_1 - x_0 (constant under
+        #               linear flow, so dx/dt = v at every t).
+        if cfg.prediction_type == "v":
+            v = pred
+        else:
+            v = (pred - x_t) / max(1.0 - t_scalar, cfg.eps)
         v = v * movable_f
 
         if use_sde:
             g2 = 0.5 * (1.0 - t_scalar)
-            score = _score_from_velocity(v, delta_t, t_scalar, cfg.eps) * movable_f
+            score = _score_from_velocity(v, x_t, pos_0, t_scalar, cfg.eps) * movable_f
             drift = v + 0.5 * g2 * score
-            noise = torch.randn_like(delta_t) * movable_f
-            delta_t = delta_t + drift * dt + (g2 * dt) ** 0.5 * noise
+            noise = torch.randn_like(x_t) * movable_f
+            x_t = x_t + drift * dt + (g2 * dt) ** 0.5 * noise
         else:
-            delta_t = delta_t + v * dt
+            x_t = x_t + v * dt
 
-        delta_t = delta_t * movable_f
+        # Freeze non-movable atoms at pos_0, zero out padding
+        x_t = x_t * movable_f + pos_0 * (1 - movable_f)
+        x_t = x_t * pad_f
 
         if return_trajectory:
-            traj.append(delta_t.clone())
+            traj.append(x_t.clone())
 
     if refine_final:
         t_final = t_vals[-1].expand(B)
-        pred_final = model_forward(delta_t, t_final) * movable_f
-        delta_final = pred_final
+        pred_final = model_forward(x_t, t_final)
+        if cfg.prediction_type == "v":
+            x_1_final = pos_0 + pred_final
+        else:
+            x_1_final = pred_final
+        x_out = x_1_final * movable_f + pos_0 * (1 - movable_f)
+        x_out = x_out * pad_f
     else:
-        delta_final = delta_t
-
-    x_out = (pos + delta_final * movable_f) * pad_f
+        x_out = x_t
 
     if not return_trajectory:
         return x_out
 
     out = {
         "x_out": x_out,
-        "delta_trajectory": torch.stack(traj, dim=0) if traj else None,
+        "x_trajectory": torch.stack(traj, dim=0) if traj else None,
     }
     if energy_traj is not None:
         out["energy_trajectory"] = energy_traj
@@ -307,11 +440,11 @@ def cfg_model_forward(
     f_uncond: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     w: float,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """f_hat = (1 + w) * f_cond - w * f_uncond."""
+    """Classifier-free guidance combiner for (x_t, t) -> pred_x_1 callables."""
 
-    def _f(delta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        fc = f_cond(delta_t, t)
-        fu = f_uncond(delta_t, t)
+    def _f(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        fc = f_cond(x_t, t)
+        fu = f_uncond(x_t, t)
         return (1.0 + w) * fc - w * fu
 
     return _f

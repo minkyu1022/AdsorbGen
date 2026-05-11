@@ -1,0 +1,19 @@
+# Minimal server-resume environment for AdsorbGen training/eval/replay.
+# Install fast-dynamics separately from https://github.com/minkyu1022/fast_dynamics:
+#   pip install -e ../fast_dynamics
+#
+# CUDA/PyTorch wheels may require the matching PyTorch index URL for the target
+# server. The current working environment used torch 2.8.0+cu128.
+torch==2.8.0
+lightning==2.6.1
+pytorch-lightning==2.6.1
+fairchem-core==2.19.0
+fairchem-data-oc==1.0.2
+ase==3.28.0
+lmdb==1.7.3
+nvalchemi-toolkit==0.1.0
+nvalchemi-toolkit-ops==0.3.1
+numpy==2.4.3
+scipy==1.17.1
+wandb==0.26.0
+tqdm==4.67.3

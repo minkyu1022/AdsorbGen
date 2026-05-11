@@ -23,11 +23,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from adsorbgen.dataset import PreprocessedDisplacementDataset
+from adsorbgen.dataset import DEFAULT_ADSORBATES_PKL, PreprocessedDisplacementDataset
 
-DEFAULT_ADSORBATES_PKL = (
-    "/home/minkyu/.local/lib/python3.11/site-packages/fairchem/data/oc/databases/pkls/adsorbates.pkl"
-)
+_PRIOR_MODE_MAP = {
+    "random":            "random",
+    "heuristic":         "heuristic",
+    "random_heuristic":  "random_site_heuristic_placement",
+}
 
 
 class MultiPlacementDataset(Dataset):
@@ -46,12 +48,17 @@ class MultiPlacementDataset(Dataset):
         num_placements: int,
         adsorbates_pkl_path: str = DEFAULT_ADSORBATES_PKL,
         max_samples: Optional[int] = None,
+        prior_mode: str = "random_heuristic",
+        interstitial_gap: float = 0.1,
+        provide_ads_ref_pos: bool = False,
     ):
         self.base = PreprocessedDisplacementDataset(
             lmdb_path,
             max_samples=max_samples,
             recenter=True,
             training_aug=False,
+            provide_ads_ref_pos=provide_ads_ref_pos,
+            adsorbates_pkl=adsorbates_pkl_path,
         )
         self.K = int(num_placements)
         assert self.K >= 1
@@ -59,6 +66,13 @@ class MultiPlacementDataset(Dataset):
         self._ads_db: Optional[dict] = None
         self._cache_base_i: int = -1
         self._cache_placements: Optional[List[dict]] = None
+        if prior_mode not in _PRIOR_MODE_MAP:
+            raise ValueError(
+                f"prior_mode must be one of {list(_PRIOR_MODE_MAP)}, got {prior_mode!r}"
+            )
+        self.prior_mode = prior_mode
+        self._fairchem_mode = _PRIOR_MODE_MAP[prior_mode]
+        self.interstitial_gap = float(interstitial_gap)
 
     def __len__(self) -> int:
         return len(self.base) * self.K
@@ -124,8 +138,8 @@ class MultiPlacementDataset(Dataset):
             adsorbate=ads,
             num_sites=self.K,
             num_augmentations_per_site=1,
-            interstitial_gap=0.1,
-            mode="random_site_heuristic_placement",
+            interstitial_gap=self.interstitial_gap,
+            mode=self._fairchem_mode,
         )
 
         n_slab = int(slab_idx.size)

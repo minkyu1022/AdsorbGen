@@ -14,7 +14,7 @@ Sampler features:
 Usage:
     PYTHONPATH=AdsorbGen python -m adsorbgen.inference \
         --ckpt runs/v2/last.ckpt \
-        --lmdb data/processed/oc20dense_val.lmdb \
+        --lmdb data/processed/oc20dense.lmdb \
         --out  runs/v2/samples.pt \
         --num-steps 50 --batch-size 8 --max-samples 128
 """
@@ -57,12 +57,17 @@ def _resolve_model_cfg(args_json_path: Path):
     with open(args_json_path) as f:
         a = json.load(f)
     arch = a.get("arch", "v1")
+    # train.py writes {"arch": ..., "model_config": {...}}; older v1 runs (pre-v2
+    # protocol) saved the config at the top level, so fall back to ``a`` when
+    # "model_config" is absent. Without this fallback, v1 runs whose overrides
+    # change atom_s/atom_z (e.g. v1-wide) load the default-width model and hit
+    # shape mismatches at state_dict load.
+    payload = a.get("model_config", a)
     if arch == "v1":
-        return DiTDenoiserConfig(**_filter_dataclass_fields(DiTDenoiserConfig, a))
+        return DiTDenoiserConfig(**_filter_dataclass_fields(DiTDenoiserConfig, payload))
     if arch == "v2":
-        model_cfg = a.get("model_config", {})
         return DiTDenoiserV2Config(
-            **_filter_dataclass_fields(DiTDenoiserV2Config, model_cfg)
+            **_filter_dataclass_fields(DiTDenoiserV2Config, payload)
         )
     raise ValueError(f"unknown arch in {args_json_path}: {arch!r}")
 
@@ -92,21 +97,32 @@ def _make_forward(
     """Build the model_forward closure for euler_sample.
 
     Captures static batch context (pos, tags, atomic_numbers, cell, masks).
-    For legacy v1 DiTDenoiser we pass zero ΔE and cond_drop=True to disable
-    the frozen conditioning head; v2 has no such signature.
+    If the v2 model has ``cfg.use_self_cond``, the closure threads the
+    previous step's detached prediction through ``prev_pred`` so each Euler
+    step sees the last forward's output (AF3-style self-conditioning).
     """
-    B = batch["pos"].shape[0]
-    device = batch["pos"].device
-    is_v1 = isinstance(model, DiTDenoiser)
-    extra = {}
-    if is_v1:
-        extra["delta_e"] = torch.zeros(B, device=device)
-        extra["cond_drop"] = torch.ones(B, device=device, dtype=torch.bool)
+    extra_static = {}
 
-    def _f(delta_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return model(
+    use_self_cond = (
+        isinstance(model, DiTDenoiserV2) and getattr(model.cfg, "use_self_cond", False)
+    )
+    use_ads_ref = bool(getattr(getattr(model, "cfg", None), "use_ads_ref_pos", False))
+    state = {"prev_pred": None}
+
+    def _f(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        extra = dict(extra_static)
+        if use_self_cond:
+            extra["prev_pred"] = state["prev_pred"]
+        if use_ads_ref:
+            if "ads_ref_pos" not in batch:
+                raise KeyError(
+                    "model requires ads_ref_pos, but the inference dataset did not "
+                    "provide it; construct the dataset with provide_ads_ref_pos=True"
+                )
+            extra["ads_ref_pos"] = batch["ads_ref_pos"]
+        out = model(
             pos=batch["pos"],
-            delta_t=delta_t,
+            x_t=x_t,
             t=t,
             atomic_numbers=batch["atomic_numbers"],
             tags=batch["tags"],
@@ -115,6 +131,9 @@ def _make_forward(
             cell=batch["cell"],
             **extra,
         )
+        if use_self_cond:
+            state["prev_pred"] = out.detach()
+        return out
     return _f
 
 
@@ -130,7 +149,11 @@ def main():
 
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--flow-eps", type=float, default=1e-5)
-    p.add_argument("--sigma", type=float, default=None, help="override sigma (else from args.json)")
+    p.add_argument("--prediction-type", type=str, choices=["x1", "v"], default=None,
+                   help="Override sampler prediction type. Default: read from args.json.")
+    p.add_argument("--prior-mode",
+                   choices=["random", "heuristic", "random_heuristic"],
+                   default="random_heuristic")
     p.add_argument("--use-sde", action="store_true")
     p.add_argument("--refine-final", action="store_true")
 
@@ -150,7 +173,7 @@ def main():
     p.add_argument("--num-samples", type=int, default=1,
                    help="K: number of random_site_heuristic_placement starts per system")
     p.add_argument("--adsorbates-pkl", type=str, default=DEFAULT_ADSORBATES_PKL,
-                   help="path to fairchem's adsorbates.pkl (only used when --num-samples > 1)")
+                   help="path to fairchem's adsorbates.pkl for K-placement and ads_ref_pos")
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--train-args-json", type=str, default=None,
@@ -170,13 +193,20 @@ def main():
 
     args_json_path = Path(args.train_args_json) if args.train_args_json else (ckpt_path.parent / "args.json")
     model_cfg = _resolve_model_cfg(args_json_path)
-    if args.sigma is not None:
-        model_cfg.sigma = args.sigma
+    with open(args_json_path) as f:
+        train_args_blob = json.load(f)
+    saved_prediction_type = (
+        train_args_blob.get("flow_config", {}).get("prediction_type")
+        or train_args_blob.get("train_args", {}).get("prediction_type")
+        or "x1"
+    )
+    prediction_type = args.prediction_type or saved_prediction_type
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(model_cfg).to(device)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"[ckpt] {ckpt_path} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
     model.eval()
+    use_ads_ref = bool(getattr(model_cfg, "use_ads_ref_pos", False))
 
     K = max(int(args.num_samples), 1)
     if K > 1:
@@ -185,13 +215,17 @@ def main():
             num_placements=K,
             adsorbates_pkl_path=args.adsorbates_pkl,
             max_samples=args.max_samples,
+            prior_mode=args.prior_mode,
+            provide_ads_ref_pos=use_ads_ref,
         )
         n_base = len(dataset.base)
-        print(f"[data] {n_base} base systems × K={K} placements from {args.lmdb}", flush=True)
+        print(f"[data] {n_base} base systems × K={K} placements (mode={args.prior_mode}) from {args.lmdb}", flush=True)
     else:
         dataset = PreprocessedDisplacementDataset(
             args.lmdb,
             max_samples=args.max_samples,
+            provide_ads_ref_pos=use_ads_ref,
+            adsorbates_pkl=args.adsorbates_pkl,
         )
         n_base = len(dataset)
         print(f"[data] {n_base} samples from {args.lmdb}", flush=True)
@@ -208,7 +242,7 @@ def main():
         drop_last=False,
     )
 
-    flow_cfg = FlowConfig(sigma=model_cfg.sigma, eps=args.flow_eps)
+    flow_cfg = FlowConfig(eps=args.flow_eps, prediction_type=prediction_type)
 
     # FK steering: energy model is loaded once and then rebound to each
     # replicated batch inside the sampling loop via make_fk_energy_fn.
@@ -286,8 +320,7 @@ def main():
 
         x_out = euler_sample(
             model_forward=model_forward,
-            pos=work["pos"],
-            cell=work["cell"],
+            pos_0=work["pos"],
             movable_mask=work["movable_mask"],
             pad_mask=work["pad_mask"],
             cfg=flow_cfg,
@@ -332,6 +365,8 @@ def main():
         cells_g = _group(cells)[:, 0]
         sids_g = _group(sids)[:, 0]
         yr_g = _group(yr)[:, 0]
+        system_keys = batch.get("system_key", [None] * (B_orig * K))
+        config_keys = batch.get("config_key", [None] * (B_orig * K))
 
         for i in range(B_orig):
             n = int(pad_g[i].sum().item())
@@ -344,6 +379,8 @@ def main():
                 "tags": tags_g[i, :n].cpu(),
                 "cell": cells_g[i].cpu(),
                 "sid": int(sids_g[i].item()),
+                "system_key": system_keys[i * K],
+                "config_key": config_keys[i * K],
                 "y_relaxed": float(yr_g[i].item()),
                 "num_placements": K,
             }
@@ -362,7 +399,8 @@ def main():
                 "lmdb": args.lmdb,
                 "arch": "v2" if isinstance(model_cfg, DiTDenoiserV2Config) else "v1",
                 "num_steps": args.num_steps,
-                "sigma": model_cfg.sigma,
+                "prediction_type": prediction_type,
+                "prior_mode": args.prior_mode,
                 "use_sde": args.use_sde,
                 "refine_final": args.refine_final,
                 "fk_particles": args.fk_particles,

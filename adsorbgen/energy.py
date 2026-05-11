@@ -104,6 +104,61 @@ class UMAEnergy(nn.Module):
         return energy
 
 
+class UMARelaxer:
+    """LBFGS relaxation via fairchem FAIRChemCalculator.
+
+    Reuses the exact logic of scripts/phase3_adsorption.py. Given a list of
+    ASE Atoms (init poses), relaxes each and returns E_sys + metadata.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "uma-s-1p1",
+        task_name: str = "oc20",
+        device: str | None = None,
+        fmax: float = 0.05,
+        max_steps: int = 100,
+    ):
+        from fairchem.core import pretrained_mlip
+        self.model_name = model_name
+        self.task_name = task_name
+        self.fmax = float(fmax)
+        self.max_steps = int(max_steps)
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.predict_unit = pretrained_mlip.get_predict_unit(
+            model_name, device=self._device,
+        )
+
+    @torch.no_grad()
+    def relax_one(self, atoms):
+        """Relax one Atoms (copied); return dict with keys:
+        atoms, E_sys, forces_max, converged, n_steps, error."""
+        from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+        from ase.optimize import LBFGS
+        import numpy as np
+
+        atoms = atoms.copy()
+        atoms.calc = FAIRChemCalculator(self.predict_unit, task_name=self.task_name)
+        opt = LBFGS(atoms, logfile=None)
+        try:
+            converged = opt.run(fmax=self.fmax, steps=self.max_steps)
+            E = float(atoms.get_potential_energy())
+            forces = atoms.get_forces()
+            fmax_val = float(np.max(np.linalg.norm(forces, axis=1)))
+            err = None
+        except Exception as e:
+            converged, E, fmax_val, err = False, float("nan"), float("nan"), str(e)
+        return {
+            "atoms": atoms, "E_sys": E, "forces_max": fmax_val,
+            "converged": bool(converged),
+            "n_steps": int(opt.nsteps) if err is None else 0,
+            "error": err,
+        }
+
+    def relax_batch(self, atoms_list):
+        return [self.relax_one(a) for a in atoms_list]
+
+
 def make_fk_energy_fn(
     energy_model: nn.Module,
     atomic_numbers: torch.Tensor,

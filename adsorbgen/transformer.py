@@ -195,3 +195,196 @@ class DiT(nn.Module):
             else:
                 x = layer(x, c, mask, pair_feats)
         return x
+
+
+class MaskedCrossAttention(nn.Module):
+    """Multi-head cross-attention with boolean kv-mask and optional pair bias.
+
+    Mirrors ``MaskedSelfAttention`` but with separate query and key/value
+    streams, used by ``DiTCrossBlock`` for the ads <- surf path.
+
+    Args:
+        dim:        Hidden dimension (shared by q and kv streams).
+        num_heads:  Number of attention heads.
+        pair_dim:   Pair feature channels; 0 disables the pair bias.
+
+    Shapes:
+        x_q:        (B, Nq, dim)
+        x_kv:       (B, Nkv, dim)
+        kv_mask:    (B, Nkv) bool
+        pair_feats: (B, Nq, Nkv, pair_dim) or None
+        output:     (B, Nq, dim)
+    """
+
+    def __init__(self, dim: int, num_heads: int, pair_dim: int = 0):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.pair_dim = pair_dim
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim, bias=True)
+        self.kv_proj = nn.Linear(dim, 2 * dim, bias=True)
+        self.proj_g = nn.Linear(dim, dim, bias=False)
+        self.proj_o = nn.Linear(dim, dim, bias=False)
+        if pair_dim > 0:
+            self.pair_norm = nn.LayerNorm(pair_dim)
+            self.pair_to_heads = nn.Linear(pair_dim, num_heads, bias=False)
+
+    def forward(
+        self,
+        x_q: torch.Tensor,
+        x_kv: torch.Tensor,
+        kv_mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, Nq, D = x_q.shape
+        Nkv = x_kv.shape[1]
+        h = self.num_heads
+        d = self.head_dim
+
+        sq = self.norm_q(x_q)
+        skv = self.norm_kv(x_kv)
+        q = self.q_proj(sq).view(B, Nq, h, d).transpose(1, 2)
+        kv = self.kv_proj(skv)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(B, Nkv, h, d).transpose(1, 2)
+        v = v.view(B, Nkv, h, d).transpose(1, 2)
+
+        key_mask = kv_mask[:, None, None, :]
+        attn_bias = torch.zeros(B, 1, 1, Nkv, device=x_q.device, dtype=q.dtype)
+        attn_bias = attn_bias.masked_fill(~key_mask, float("-inf"))
+
+        if self.pair_dim > 0 and pair_feats is not None:
+            pair_logits = self.pair_to_heads(self.pair_norm(pair_feats))  # (B, Nq, Nkv, H)
+            pair_logits = pair_logits.permute(0, 3, 1, 2).to(q.dtype)     # (B, H, Nq, Nkv)
+            attn_bias = attn_bias + pair_logits
+
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        o = o.transpose(1, 2).reshape(B, Nq, D)
+
+        g = torch.sigmoid(self.proj_g(sq))
+        return self.proj_o(g * o)
+
+
+class DiTCrossBlock(nn.Module):
+    """Two-stream DiT block: ads self-attn -> ads<-surf cross-attn -> ads FFN.
+
+    Operates on the full (B, N, dim) token stream but only writes updates
+    to positions flagged by ``update_mask`` (adsorbate tokens). Surface and
+    bulk tokens pass through unchanged, matching the design intent that
+    surfaces are a static context the adsorbate denoiser cross-attends into.
+
+    adaLN-Zero conditioning is shared across the three sub-blocks but
+    modulated with 9 chunks (3 shift/scale/gate triples).
+
+    Args:
+        dim, num_heads, pair_dim, mlp_ratio, dropout: standard DiT block args.
+    """
+
+    def __init__(self, dim: int, num_heads: int, pair_dim: int = 0, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.pair_dim = pair_dim
+        self.norm_sa = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.self_attn = MaskedSelfAttention(dim=dim, num_heads=num_heads, pair_dim=pair_dim)
+        self.norm_ca = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = MaskedCrossAttention(dim=dim, num_heads=num_heads, pair_dim=pair_dim)
+        self.norm_mlp = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), dropout=dropout)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 9 * dim, bias=True),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        if self.pair_dim > 0:
+            nn.init.zeros_(self.self_attn.pair_to_heads.weight)
+            nn.init.zeros_(self.cross_attn.pair_to_heads.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        sa_mask: torch.Tensor,
+        ca_kv_mask: torch.Tensor,
+        update_mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # sa_mask:     (B, N) keys for self-attn (ads tokens)
+        # ca_kv_mask:  (B, N) keys for cross-attn (surf tokens)
+        # update_mask: (B, N) True where this block may write (ads tokens)
+        chunks = self.adaLN_modulation(c).chunk(9, dim=1)
+        (
+            shift_sa, scale_sa, gate_sa,
+            shift_ca, scale_ca, gate_ca,
+            shift_mlp, scale_mlp, gate_mlp,
+        ) = chunks
+
+        write = update_mask.unsqueeze(-1).to(x.dtype)  # (B, N, 1)
+
+        h_sa = self.self_attn(modulate(self.norm_sa(x), shift_sa, scale_sa), sa_mask, pair_feats)
+        x = x + write * (gate_sa.unsqueeze(1) * h_sa)
+
+        h_ca = self.cross_attn(modulate(self.norm_ca(x), shift_ca, scale_ca), x, ca_kv_mask, pair_feats)
+        x = x + write * (gate_ca.unsqueeze(1) * h_ca)
+
+        h_mlp = self.mlp(modulate(self.norm_mlp(x), shift_mlp, scale_mlp))
+        x = x + write * (gate_mlp.unsqueeze(1) * h_mlp)
+        return x
+
+
+class DiTCrossAttn(nn.Module):
+    """Stack of ``DiTCrossBlock`` layers for the two-stream ads/surf variant."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        pair_dim: int = 0,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        activation_checkpointing: bool = False,
+    ):
+        super().__init__()
+        self.activation_checkpointing = activation_checkpointing
+        self.layers = nn.ModuleList(
+            [
+                DiTCrossBlock(
+                    dim=dim, num_heads=num_heads, pair_dim=pair_dim,
+                    mlp_ratio=mlp_ratio, dropout=dropout,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        sa_mask: torch.Tensor,
+        ca_kv_mask: torch.Tensor,
+        update_mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            if self.activation_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, c, sa_mask, ca_kv_mask, update_mask, pair_feats,
+                    use_reentrant=False,
+                )
+            else:
+                x = layer(x, c, sa_mask, ca_kv_mask, update_mask, pair_feats)
+        return x
