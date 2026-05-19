@@ -70,7 +70,7 @@ def main():
     p.add_argument("--uma-model", default="uma-s-1p1")
     p.add_argument("--uma-task", default="oc20")
     p.add_argument("--uma-fmax", type=float, default=0.05)
-    p.add_argument("--uma-max-steps", type=int, default=1000)
+    p.add_argument("--uma-max-steps", type=int, default=300)
     p.add_argument("--uma-fire-dt", type=float, default=0.02)
     p.add_argument("--atom-budget", type=int, default=4000)
     p.add_argument("--save-every-chunks", type=int, default=20)

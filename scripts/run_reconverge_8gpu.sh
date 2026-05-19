@@ -10,6 +10,7 @@ LOG_DIR=${LOG_DIR:-/home/irteam/data/replay/reconverge_logs}
 NUM_SHARDS=${NUM_SHARDS:-8}
 ATOM_BUDGET=${ATOM_BUDGET:-4000}
 UMA_MAX_STEPS=${UMA_MAX_STEPS:-300}
+UMA_TASK=${UMA_TASK:-oc20}
 UMA_FMAX=${UMA_FMAX:-0.05}
 PYTHON_BIN=${PYTHON_BIN:-/home1/irteam/micromamba/envs/adsorbgen/bin/python}
 
@@ -36,7 +37,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
         --num-shards "$NUM_SHARDS" \
         --shards-dir "$SHARDS_DIR" \
         --uma-model uma-s-1p1 \
-        --uma-task oc20 \
+        --uma-task "$UMA_TASK" \
         --uma-fmax "$UMA_FMAX" \
         --uma-max-steps "$UMA_MAX_STEPS" \
         --atom-budget "$ATOM_BUDGET"
