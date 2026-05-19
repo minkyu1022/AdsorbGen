@@ -63,10 +63,11 @@ The current long-running workflow is:
    - `/home/irteam/data/replay/gt_index_by_system_oc20.pkl`
 3. Write convergence-step statistics:
    - `/home/irteam/data/replay/E_sys_step_stats.json`
-4. Build derived MLIP-relaxed LMDBs under:
-   - `/home/irteam/data/processed_mlip_oc20/`
-5. Run one 5000-system x 10-placement replay cycle using the rebuilt
-   OC20/mean-energy reference.
+4. Stop. No 5000-system x 10-placement replay cycle is launched by the
+   finalize watcher.
+
+Optional derived MLIP-relaxed LMDBs can be built separately by setting
+`BUILD_MLIP_LMDBS=1` when running the finalize script. By default this is off.
 
 ## Dropbox Upload
 
@@ -112,6 +113,7 @@ Logs:
 ```text
 /home/irteam/data/replay/e_sys_finalize.log
 /home/irteam/data/replay/finalize_reconverge_replay5000_*.log
+/home/irteam/data/replay/finalize_reconverge_refs_*.log
 /home/irteam/data/replay/e_sys_logs/
 /home/irteam/data/replay/reconverge_logs/
 /home/irteam/data/replay/dropbox_required_upload.log
@@ -125,7 +127,6 @@ Run outputs:
 /home/irteam/runs/H200_ads_pair_dist_loss/overlap_diag_300.json
 /home/irteam/runs/H200_ads_pair_dist_loss/replay_stream/logs/
 /home/irteam/runs/H200_ads_pair_dist_loss/replay_stream/shard_*/
-/home/irteam/runs/H200_ads_pair_dist_loss/replay_stream_oc20_mean_5000x10_*/
 /home/irteam/runs/H200_ads_pair_dist_loss/success_trajectories/
 ```
 

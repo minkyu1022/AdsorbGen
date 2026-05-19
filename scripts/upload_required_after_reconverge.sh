@@ -81,6 +81,7 @@ rclone copy "$OUT_DIR" "${DEST}/replay_refs" \
   --include "E_sys_step_stats.json" \
   --include "e_sys_finalize.log" \
   --include "finalize_reconverge_replay5000_*.log" \
+  --include "finalize_reconverge_refs_*.log" \
   --include "dropbox_required_upload.log" \
   --include "e_sys_logs/**" \
   --include "reconverge_logs/**" \
@@ -94,9 +95,6 @@ rclone copy "$RUN_DIR" "${DEST}/run_H200_ads_pair_dist_loss" \
   --include "overlap_diag_300.json" \
   --include "replay_stream/logs/**" \
   --include "replay_stream/shard_*/**" \
-  --include "replay_stream_oc20_mean_5000x10_*/logs/**" \
-  --include "replay_stream_oc20_mean_5000x10_*/shard_*/**" \
-  --include "replay_stream_oc20_mean_5000x10_*/cycle_000000_report.json" \
   --include "success_trajectories/**" \
   --exclude "*"
 
