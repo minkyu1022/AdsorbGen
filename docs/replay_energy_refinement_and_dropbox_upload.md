@@ -56,7 +56,8 @@ The current long-running workflow is:
    - model: `uma-s-1p1`
    - task: `oc20`
    - `fmax=0.05 eV/A`
-   - `max_steps=500`
+   - `max_steps=300` additional FIRE steps after the first-pass 200-step run
+     (about 500 total steps for previously unconverged samples)
 2. Rebuild merged references:
    - `/home/irteam/data/replay/E_sys.pkl`
    - `/home/irteam/data/replay/gt_index_by_sid_oc20.pkl`
@@ -68,8 +69,8 @@ The current long-running workflow is:
 
 Optional derived MLIP-relaxed LMDBs can be built separately by setting
 `BUILD_MLIP_LMDBS=1` when running the finalize script. By default this is off.
-For the current `max_steps=500` reconvergence run, the active finalize watcher
-was launched with `BUILD_MLIP_LMDBS=1`, so it will create
+For the current extra-`max_steps=300` reconvergence run, the active finalize
+watcher was launched with `BUILD_MLIP_LMDBS=1`, so it will create
 `/home/irteam/data/processed_mlip_oc20/*.lmdb` after rebuilding the final refs.
 
 ## Dropbox Upload

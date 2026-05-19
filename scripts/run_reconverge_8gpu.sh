@@ -9,7 +9,7 @@ SHARDS_DIR=${SHARDS_DIR:-/home/irteam/data/replay/e_sys_shards}
 LOG_DIR=${LOG_DIR:-/home/irteam/data/replay/reconverge_logs}
 NUM_SHARDS=${NUM_SHARDS:-8}
 ATOM_BUDGET=${ATOM_BUDGET:-4000}
-UMA_MAX_STEPS=${UMA_MAX_STEPS:-500}
+UMA_MAX_STEPS=${UMA_MAX_STEPS:-300}
 UMA_FMAX=${UMA_FMAX:-0.05}
 PYTHON_BIN=${PYTHON_BIN:-/home1/irteam/micromamba/envs/adsorbgen/bin/python}
 
