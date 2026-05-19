@@ -56,7 +56,7 @@ The current long-running workflow is:
    - model: `uma-s-1p1`
    - task: `oc20`
    - `fmax=0.05 eV/A`
-   - `max_steps=1000`
+   - `max_steps=500`
 2. Rebuild merged references:
    - `/home/irteam/data/replay/E_sys.pkl`
    - `/home/irteam/data/replay/gt_index_by_sid_oc20.pkl`
