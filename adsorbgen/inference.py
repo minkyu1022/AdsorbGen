@@ -35,7 +35,7 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from adsorbgen.dataset import PreprocessedDisplacementDataset, collate_displacement  # noqa: E402
+from adsorbgen.dataset import PlacementPriorDataset, PreprocessedDisplacementDataset, collate_displacement  # noqa: E402
 from adsorbgen.flow import FKSteeringConfig, FlowConfig, euler_sample  # noqa: E402
 from adsorbgen.model import DiTDenoiser, DiTDenoiserConfig  # noqa: E402
 from adsorbgen.model_factory import build_model  # noqa: E402
@@ -146,14 +146,20 @@ def main():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--save-trajectories", type=int, default=0,
+                   help="store Euler x_t trajectories for the first N base samples in the output dump")
 
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--flow-eps", type=float, default=1e-5)
     p.add_argument("--prediction-type", type=str, choices=["x1", "v"], default=None,
                    help="Override sampler prediction type. Default: read from args.json.")
     p.add_argument("--prior-mode",
-                   choices=["random", "heuristic", "random_heuristic"],
+                   choices=["random", "heuristic", "random_heuristic",
+                            "harmonic_uniform", "harmonic_centered", "catflow_center_rel"],
                    default="random_heuristic")
+    p.add_argument("--use-placement-prior", action="store_true",
+                   help="for K=1, replace adsorbate pos with a fresh fairchem placement, matching training sample_eval")
+    p.add_argument("--interstitial-gap", type=float, default=0.1)
     p.add_argument("--use-sde", action="store_true")
     p.add_argument("--refine-final", action="store_true")
 
@@ -220,6 +226,21 @@ def main():
         )
         n_base = len(dataset.base)
         print(f"[data] {n_base} base systems × K={K} placements (mode={args.prior_mode}) from {args.lmdb}", flush=True)
+    elif args.use_placement_prior:
+        dataset = PlacementPriorDataset(
+            args.lmdb,
+            max_samples=args.max_samples,
+            prior_mode=args.prior_mode,
+            interstitial_gap=args.interstitial_gap,
+            provide_ads_ref_pos=use_ads_ref,
+            adsorbates_pkl=args.adsorbates_pkl,
+        )
+        n_base = len(dataset)
+        print(
+            f"[data] {n_base} samples with fresh placement "
+            f"(mode={args.prior_mode}) from {args.lmdb}",
+            flush=True,
+        )
     else:
         dataset = PreprocessedDisplacementDataset(
             args.lmdb,
@@ -318,7 +339,8 @@ def main():
 
         model_forward = _make_forward(model=model, batch=work)
 
-        x_out = euler_sample(
+        want_traj = args.save_trajectories > 0 and len(all_records) < args.save_trajectories
+        sample_out = euler_sample(
             model_forward=model_forward,
             pos_0=work["pos"],
             movable_mask=work["movable_mask"],
@@ -327,9 +349,15 @@ def main():
             num_steps=args.num_steps,
             use_sde=args.use_sde,
             refine_final=args.refine_final,
-            return_trajectory=False,
+            return_trajectory=want_traj,
             fk_steering=fk_cfg,
         )
+        if want_traj:
+            x_out = sample_out["x_out"]
+            x_traj = sample_out["x_trajectory"]
+        else:
+            x_out = sample_out
+            x_traj = None
 
         # Collapse FK groups by keeping particle 0 (FK reorders within a group,
         # so any particle is fine — downstream eval can re-rank if desired).
@@ -339,6 +367,15 @@ def main():
             return t.view(BK, P, *t.shape[1:])[:, 0]
 
         x_final = _pick(x_out)          # (BK, N, 3)
+        traj_g = None
+        if x_traj is not None:
+            # (T, BK*P, N, 3) -> keep particle 0 if FK is active, then group by
+            # base system and placement.
+            if P == 1:
+                traj_pick = x_traj
+            else:
+                traj_pick = x_traj.view(x_traj.shape[0], BK, P, *x_traj.shape[2:])[:, :, 0]
+            traj_g = traj_pick.view(traj_pick.shape[0], B_orig, K, *traj_pick.shape[2:])
         pos_ref = _pick(work["pos"])    # (BK, N, 3)
         pos_gt_bk = _pick(pos_gt_work)  # (BK, N, 3)
         pad = _pick(work["pad_mask"])
@@ -384,6 +421,11 @@ def main():
                 "y_relaxed": float(yr_g[i].item()),
                 "num_placements": K,
             }
+            if traj_g is not None and len(all_records) < args.save_trajectories:
+                rec["x_trajectory"] = (
+                    traj_g[:, i, :, :n].cpu()
+                    if K > 1 else traj_g[:, i, 0, :n].cpu()
+                )
             all_records.append(rec)
 
         n_done += B_orig
@@ -409,6 +451,7 @@ def main():
                 "fk_uma_model": args.fk_uma_model if args.fk_particles > 0 and args.fk_energy == "uma" else None,
                 "num_placements": K,
                 "n_samples": len(all_records),
+                "n_trajectories_saved": sum(1 for r in all_records if "x_trajectory" in r),
             },
         },
         out_path,

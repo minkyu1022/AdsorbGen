@@ -158,6 +158,7 @@ class PreprocessedDisplacementDataset(Dataset):
         training_aug: bool = False,
         translation_std: float = 0.5,
         skip_anomaly: bool = True,
+        unique_by_system_key: bool = False,
         provide_ads_ref_pos: bool = False,
         adsorbates_pkl: str = DEFAULT_ADSORBATES_PKL,
     ):
@@ -166,6 +167,7 @@ class PreprocessedDisplacementDataset(Dataset):
         self.training_aug = bool(training_aug)
         self.translation_std = float(translation_std)
         self.skip_anomaly = bool(skip_anomaly)
+        self.unique_by_system_key = bool(unique_by_system_key)
         self.provide_ads_ref_pos = bool(provide_ads_ref_pos)
         self.adsorbates_pkl = str(adsorbates_pkl) if provide_ads_ref_pos else None
         self._env = None
@@ -193,11 +195,46 @@ class PreprocessedDisplacementDataset(Dataset):
                 f"total={n_total} clean={n_clean} filtered={n_total - n_clean}",
                 flush=True,
             )
-            self.n = n_clean if max_samples is None else min(n_clean, max_samples)
-            if max_samples is not None:
-                self._idx_map = self._idx_map[:self.n]
+            candidate_indices = self._idx_map
         else:
-            self.n = n_total if max_samples is None else min(n_total, max_samples)
+            candidate_indices = np.arange(n_total, dtype=np.int64)
+
+        if self.unique_by_system_key:
+            env = lmdb.open(self.lmdb_path, subdir=False, readonly=True, lock=False)
+            unique_indices = []
+            seen = set()
+            with env.begin() as txn:
+                for raw_idx in candidate_indices.tolist():
+                    raw_entry = txn.get(str(int(raw_idx)).encode("ascii"))
+                    if raw_entry is None:
+                        continue
+                    entry = pickle.loads(raw_entry)
+                    if "system_key" in entry:
+                        key = str(entry["system_key"])
+                    else:
+                        sid = int(entry.get("sid", -1))
+                        key = f"sid:{sid}" if sid >= 0 else f"idx:{raw_idx}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique_indices.append(int(raw_idx))
+            env.close()
+            candidate_indices = np.asarray(unique_indices, dtype=np.int64)
+            print(
+                f"[dataset] {self.lmdb_path}: unique_by_system_key=True "
+                f"unique={candidate_indices.size}",
+                flush=True,
+            )
+
+        if max_samples is not None:
+            candidate_indices = candidate_indices[: int(max_samples)]
+
+        if candidate_indices.size != n_total or self.unique_by_system_key:
+            self._idx_map = candidate_indices.astype(np.int64)
+            self.n = int(self._idx_map.size)
+        else:
+            self._idx_map = None
+            self.n = n_total
 
     def __len__(self) -> int:
         return self.n
@@ -274,6 +311,17 @@ _PRIOR_MODE_MAP = {
     "random_heuristic":  "random_site_heuristic_placement",
 }
 
+_CUSTOM_PRIOR_MODES = {
+    "harmonic_uniform",
+    "harmonic_centered",
+    "catflow_center_rel",
+}
+
+_CATFLOW_ADS_CENTER_MEAN = np.asarray([-0.4249, -0.0863, 5.8592], dtype=np.float32)
+_CATFLOW_ADS_CENTER_STD = np.asarray([2.9450, 3.2665, 1.7597], dtype=np.float32)
+_CATFLOW_ADS_REL_POS_MEAN = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+_CATFLOW_ADS_REL_POS_STD = np.asarray([0.6319, 0.8760, 0.7194], dtype=np.float32)
+
 
 class PlacementPriorDataset(PreprocessedDisplacementDataset):
     """Training dataset whose `pos` is a fresh fairchem placement each call.
@@ -301,12 +349,13 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         **base_kwargs,
     ):
         super().__init__(lmdb_path, **base_kwargs)
-        if prior_mode not in _PRIOR_MODE_MAP:
+        if prior_mode not in _PRIOR_MODE_MAP and prior_mode not in _CUSTOM_PRIOR_MODES:
             raise ValueError(
-                f"prior_mode must be one of {list(_PRIOR_MODE_MAP)}, got {prior_mode!r}"
+                f"prior_mode must be one of {list(_PRIOR_MODE_MAP) + sorted(_CUSTOM_PRIOR_MODES)}, "
+                f"got {prior_mode!r}"
             )
         self.prior_mode = prior_mode
-        self._fairchem_mode = _PRIOR_MODE_MAP[prior_mode]
+        self._fairchem_mode = _PRIOR_MODE_MAP.get(prior_mode)
         self.interstitial_gap = float(interstitial_gap)
         self.adsorbates_pkl = str(adsorbates_pkl)
         if on_failure not in ("fallback", "raise"):
@@ -377,6 +426,70 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         ads_placement = new_pos[n_slab:]
         return ads_placement
 
+    def _draw_harmonic_placement(
+        self,
+        pos: np.ndarray,
+        cell: np.ndarray,
+        tags: np.ndarray,
+        ads_idx: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """AdsorbSample-style harmonic source for adsorbate x_0."""
+        if ads_idx.size == 0:
+            return None
+        slab_idx = np.where(tags != 2)[0]
+        if slab_idx.size == 0:
+            return None
+
+        a = cell[0].astype(np.float32)
+        b = cell[1].astype(np.float32)
+        normal = np.cross(a, b).astype(np.float32)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm < 1e-8:
+            return None
+        normal = normal / normal_norm
+
+        h_top = float(np.max(pos[slab_idx] @ normal))
+        h_target = max(
+            h_top + 2.0 + 0.2 * float(np.random.randn()),
+            h_top + 1.2,
+        )
+
+        if self.prior_mode == "harmonic_centered":
+            lateral = pos[slab_idx].mean(axis=0).astype(np.float32)
+            noise2 = np.random.randn(2).astype(np.float32) * 0.5
+            lateral = lateral + noise2[0] * a + noise2[1] * b
+        else:
+            uv = np.random.rand(2).astype(np.float32)
+            lateral = uv[0] * a + uv[1] * b
+
+        lateral_h = float(lateral @ normal)
+        anchor = lateral + (h_target - lateral_h) * normal
+
+        n_ads = int(ads_idx.size)
+        local = np.random.randn(n_ads, 3).astype(np.float32)
+        local = local - local.mean(axis=0, keepdims=True)
+        local = local * (1.0 / np.sqrt(max(n_ads, 1)))
+
+        out = local + anchor[None, :]
+        min_height = float(np.min(out @ normal))
+        shift = max(0.0, h_top + 1.2 - min_height)
+        if shift > 0.0:
+            out = out + shift * normal[None, :]
+        return out.astype(np.float32)
+
+    def _draw_catflow_center_rel_placement(self, ads_idx: np.ndarray) -> Optional[np.ndarray]:
+        """CatFlow-style adsorbate prior: center plus sum-to-zero rel-pos."""
+        n_ads = int(ads_idx.size)
+        if n_ads == 0:
+            return None
+        center_norm = np.random.randn(3).astype(np.float32)
+        center = center_norm * _CATFLOW_ADS_CENTER_STD + _CATFLOW_ADS_CENTER_MEAN
+
+        rel_norm = np.random.randn(n_ads, 3).astype(np.float32)
+        rel_norm = rel_norm - rel_norm.mean(axis=0, keepdims=True)
+        rel = rel_norm * _CATFLOW_ADS_REL_POS_STD[None, :] + _CATFLOW_ADS_REL_POS_MEAN[None, :]
+        return (center[None, :] + rel).astype(np.float32)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         self._ensure_env()
         real_idx = int(self._idx_map[idx]) if self._idx_map is not None else int(idx)
@@ -386,8 +499,8 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
             raise IndexError(f"Key {real_idx} not found in {self.lmdb_path}")
         entry = pickle.loads(raw)
 
-        # fresh placement for adsorbate atoms
-        ads_placement = self._draw_placement(entry)
+        custom_prior = self.prior_mode in _CUSTOM_PRIOR_MODES
+        ads_placement = None if custom_prior else self._draw_placement(entry)
 
         pos = np.asarray(entry["pos"], dtype=np.float32).copy()
         tags_np = np.asarray(entry["tags"]).astype(np.int64)
@@ -414,6 +527,26 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
             shift = -pos_t.mean(dim=0, keepdim=True)
             pos_t = pos_t + shift
             pos_rel = pos_rel + shift
+        if custom_prior:
+            cell_np = np.asarray(entry["cell"], dtype=np.float32)
+            if cell_np.ndim == 3:
+                cell_np = cell_np[0]
+            if self.prior_mode.startswith("harmonic_"):
+                ads_placement = self._draw_harmonic_placement(
+                    pos_t.numpy(), cell_np, tags_np, ads_idx_np,
+                )
+            else:
+                ads_placement = self._draw_catflow_center_rel_placement(ads_idx_np)
+            if ads_placement is not None:
+                ads_idx_t = torch.as_tensor(ads_idx_np, dtype=torch.long)
+                pos_t[ads_idx_t] = torch.from_numpy(ads_placement)
+            else:
+                self._n_fallbacks += 1
+                if self.on_failure == "raise":
+                    raise RuntimeError(
+                        f"custom placement failed for sid={entry.get('sid')} "
+                        f"ads_id={entry.get('ads_id')}"
+                    )
         if self.training_aug and self.translation_std > 0.0:
             trans = torch.randn(1, 3) * self.translation_std
             pos_t = pos_t + trans

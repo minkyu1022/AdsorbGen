@@ -113,6 +113,23 @@ class DiTDenoiserConfig:
     typed_pair_include_bulk: bool = False
     max_topological_distance: int = 8
     ads_bond_factor: float = 1.25
+    # Coordinate preconditioning for the v1/AtomMOF-style absolute-x1 model.
+    # Pair distances, MIC, RBF cutoffs, and losses stay in raw Angstrom space;
+    # only the linear coordinate projections and output head are wrapped.
+    coord_norm_mode: str = "none"
+    coord_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    coord_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    ads_ref_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ads_ref_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # CatFlow-style adsorbate output factorization. When enabled, surface
+    # atoms still use the regular coordinate head, while adsorbate atoms are
+    # reconstructed from a pooled center head plus a per-atom rel-pos head.
+    use_ads_center_rel_head: bool = False
+    ads_center_mean: tuple[float, float, float] = (-0.4249, -0.0863, 5.8592)
+    ads_center_scale: tuple[float, float, float] = (2.9450, 3.2665, 1.7597)
+    ads_rel_pos_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ads_rel_pos_scale: tuple[float, float, float] = (0.6319, 0.8760, 0.7194)
+    ads_rel_output_sum_zero: bool = False
 
 
 class CellEmbedder(nn.Module):
@@ -216,6 +233,9 @@ class DiTDenoiser(nn.Module):
         self.movable_embed = nn.Embedding(2, atom_s)
         self.pos_proj = nn.Linear(3, atom_s, bias=True)
         self.xt_proj = nn.Linear(3, atom_s, bias=True)
+        if cfg.use_ads_center_rel_head:
+            self.ads_center_xt_proj = nn.Linear(3, atom_s, bias=True)
+            self.ads_rel_xt_proj = nn.Linear(3, atom_s, bias=True)
         # CatFlow-style ads-reference geometry projection (only on tag==2 atoms).
         if cfg.use_ads_ref_pos:
             self.ads_ref_proj = nn.Linear(3, atom_s, bias=False)
@@ -333,15 +353,120 @@ class DiTDenoiser(nn.Module):
 
         # ── Output head (zero-init) ──
         self.out_norm = nn.LayerNorm(atom_s, elementwise_affine=False, eps=1e-6)
-        self.out_proj = nn.Linear(atom_s, 3, bias=True)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        self.coord_out = nn.Linear(atom_s, 3, bias=True)
+        nn.init.zeros_(self.coord_out.weight)
+        nn.init.zeros_(self.coord_out.bias)
         if cfg.use_ads_specific_head:
-            self.ads_out_proj = nn.Linear(atom_s, 3, bias=True)
-            nn.init.zeros_(self.ads_out_proj.weight)
-            nn.init.zeros_(self.ads_out_proj.bias)
+            self.ads_coord_out = nn.Linear(atom_s, 3, bias=True)
+            nn.init.zeros_(self.ads_coord_out.weight)
+            nn.init.zeros_(self.ads_coord_out.bias)
+        if cfg.use_ads_center_rel_head:
+            self.ads_center_out = nn.Linear(atom_s, 3, bias=True)
+            self.ads_rel_pos_out = nn.Linear(atom_s, 3, bias=True)
+            nn.init.zeros_(self.ads_center_out.weight)
+            nn.init.zeros_(self.ads_center_out.bias)
+            nn.init.zeros_(self.ads_rel_pos_out.weight)
+            nn.init.zeros_(self.ads_rel_pos_out.bias)
+
+        self.register_buffer(
+            "_coord_mean",
+            torch.tensor(cfg.coord_mean, dtype=torch.float32).view(1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_coord_scale",
+            torch.tensor(cfg.coord_scale, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_ref_mean",
+            torch.tensor(cfg.ads_ref_mean, dtype=torch.float32).view(1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_ref_scale",
+            torch.tensor(cfg.ads_ref_scale, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_center_mean",
+            torch.tensor(cfg.ads_center_mean, dtype=torch.float32).view(1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_center_scale",
+            torch.tensor(cfg.ads_center_scale, dtype=torch.float32).clamp_min(1e-6).view(1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_rel_pos_mean",
+            torch.tensor(cfg.ads_rel_pos_mean, dtype=torch.float32).view(1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_ads_rel_pos_scale",
+            torch.tensor(cfg.ads_rel_pos_scale, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 3),
+            persistent=False,
+        )
 
     # ── helpers ──
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward compatibility for checkpoints saved before output heads were
+        # renamed from *_proj to *_out.
+        aliases = {
+            "out_proj": "coord_out",
+            "ads_out_proj": "ads_coord_out",
+            "ads_center_out_proj": "ads_center_out",
+            "ads_rel_out_proj": "ads_rel_pos_out",
+        }
+        for old_name, new_name in aliases.items():
+            for suffix in ("weight", "bias"):
+                old_key = f"{prefix}{old_name}.{suffix}"
+                new_key = f"{prefix}{new_name}.{suffix}"
+                if old_key in state_dict:
+                    if new_key not in state_dict:
+                        state_dict[new_key] = state_dict[old_key]
+                    state_dict.pop(old_key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+    def _normalize_coord(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self._coord_mean.to(dtype=x.dtype, device=x.device)) / self._coord_scale.to(dtype=x.dtype, device=x.device)
+
+    def _denormalize_coord(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self._coord_scale.to(dtype=x.dtype, device=x.device) + self._coord_mean.to(dtype=x.dtype, device=x.device)
+
+    def _normalize_ads_ref(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self._ads_ref_mean.to(dtype=x.dtype, device=x.device)) / self._ads_ref_scale.to(dtype=x.dtype, device=x.device)
+
+    def _normalize_ads_center(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self._ads_center_mean.to(dtype=x.dtype, device=x.device)) / self._ads_center_scale.to(dtype=x.dtype, device=x.device)
+
+    def _denormalize_ads_center(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self._ads_center_scale.to(dtype=x.dtype, device=x.device) + self._ads_center_mean.to(dtype=x.dtype, device=x.device)
+
+    def _normalize_ads_rel_pos(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self._ads_rel_pos_mean.to(dtype=x.dtype, device=x.device)) / self._ads_rel_pos_scale.to(dtype=x.dtype, device=x.device)
+
+    def _denormalize_ads_rel_pos(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self._ads_rel_pos_scale.to(dtype=x.dtype, device=x.device) + self._ads_rel_pos_mean.to(dtype=x.dtype, device=x.device)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+        w = mask.unsqueeze(-1).to(dtype=x.dtype, device=x.device)
+        return (x * w).sum(dim=dim) / w.sum(dim=dim).clamp_min(1.0)
 
     def _encode_tokens(
         self,
@@ -353,6 +478,8 @@ class DiTDenoiser(nn.Module):
         pad_mask: torch.Tensor,
         cell: torch.Tensor,
         ads_ref_pos: Optional[torch.Tensor] = None,
+        ads_center_t: Optional[torch.Tensor] = None,
+        ads_rel_pos_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Atom single: element + tag + movable + x_0 (pos) + x_t + cell
         (+ optional CatFlow-style ads reference geometry on tag==2 atoms).
@@ -361,13 +488,32 @@ class DiTDenoiser(nn.Module):
         independent linear maps so the model sees current state and the
         static anchor.
         """
+        # Only x_t (and coordinate output heads) go through the normalization
+        # wrapper. For the CatFlow-style ads split variant, adsorbate x_t is
+        # exposed as normalized center + normalized rel-pos rather than a
+        # single absolute coordinate projection.
+        x_t_in = self._normalize_coord(x_t)
+        xt_tokens = self.xt_proj(x_t_in)
+        if self.cfg.use_ads_center_rel_head:
+            ads_mask_bool = (tags == 2) & movable_mask & pad_mask
+            ads_mask = ads_mask_bool.unsqueeze(-1).to(x_t.dtype)
+            if ads_center_t is None:
+                ads_center_t = self._masked_mean(x_t, ads_mask_bool, dim=1)
+            if ads_rel_pos_t is None:
+                ads_rel_pos_t = (x_t - ads_center_t[:, None, :]) * ads_mask
+            ads_rel_pos_t = ads_rel_pos_t * ads_mask
+            ads_xt_tokens = (
+                self.ads_center_xt_proj(self._normalize_ads_center(ads_center_t)).unsqueeze(1)
+                + self.ads_rel_xt_proj(self._normalize_ads_rel_pos(ads_rel_pos_t))
+            )
+            xt_tokens = ads_xt_tokens * ads_mask + xt_tokens * (1.0 - ads_mask)
         cell_emb = self.cell_embedder(cell).unsqueeze(1)  # (B, 1, atom_s)
         tokens = (
             self.atom_embed(atomic_numbers.clamp_max(self.cfg.num_elements - 1))
             + self.tag_embed(tags.clamp(0, self.cfg.num_tags - 1))
             + self.movable_embed(movable_mask.long())
             + self.pos_proj(pos)
-            + self.xt_proj(x_t)
+            + xt_tokens
             + cell_emb
         )
         if self.cfg.use_ads_ref_pos:
@@ -517,6 +663,9 @@ class DiTDenoiser(nn.Module):
         pad_mask: torch.Tensor,
         cell: torch.Tensor,
         ads_ref_pos: Optional[torch.Tensor] = None,
+        ads_center_t: Optional[torch.Tensor] = None,
+        ads_rel_pos_t: Optional[torch.Tensor] = None,
+        return_ads_components: bool = False,
     ) -> torch.Tensor:
         """Predict x_1 (absolute coordinates) directly.
 
@@ -543,6 +692,7 @@ class DiTDenoiser(nn.Module):
             pos=pos, x_t=x_t, atomic_numbers=atomic_numbers,
             tags=tags, movable_mask=movable_mask, pad_mask=pad_mask,
             cell=cell, ads_ref_pos=ads_ref_pos,
+            ads_center_t=ads_center_t, ads_rel_pos_t=ads_rel_pos_t,
         )  # (B, N, atom_s)
         pair_pos = x_t if self.cfg.use_dynamic_pair_dist else pos
         pair_feats = self._build_pair_features(
@@ -599,10 +749,23 @@ class DiTDenoiser(nn.Module):
         # Non-movable atoms are forced to pos_0 (their x_1 equals x_0 by
         # construction). Padding zeroed.
         x = self.out_norm(x)
-        out = self.out_proj(x)  # (B, N, 3); at init, out_proj weights are 0 → out ≈ 0
-        if self.cfg.use_ads_specific_head:
+        out = self.coord_out(x)  # normalized coordinate space
+        if self.cfg.use_ads_specific_head and not self.cfg.use_ads_center_rel_head:
             ads_mask = (tags == 2).unsqueeze(-1).to(out.dtype)
-            ads_out = self.ads_out_proj(x)
+            ads_out = self.ads_coord_out(x)
+            out = ads_out * ads_mask + out * (1.0 - ads_mask)
+        out = self._denormalize_coord(out)
+
+        if self.cfg.use_ads_center_rel_head:
+            ads_mask_bool = (tags == 2) & movable_mask & pad_mask
+            ads_mask = ads_mask_bool.unsqueeze(-1).to(out.dtype)
+            ads_global = self._masked_mean(x, ads_mask_bool, dim=1)
+            ads_center = self._denormalize_ads_center(self.ads_center_out(ads_global))
+            ads_rel = self._denormalize_ads_rel_pos(self.ads_rel_pos_out(x))
+            ads_rel = ads_rel * ads_mask
+            if self.cfg.ads_rel_output_sum_zero:
+                ads_rel = ads_rel - self._masked_mean(ads_rel, ads_mask_bool, dim=1)[:, None, :] * ads_mask
+            ads_out = ads_center[:, None, :] + ads_rel
             out = ads_out * ads_mask + out * (1.0 - ads_mask)
 
         movable_f = movable_mask.unsqueeze(-1).to(out.dtype)
@@ -612,4 +775,10 @@ class DiTDenoiser(nn.Module):
 
         if self.training and not torch.isfinite(pred_x_1).all():
             raise RuntimeError("NaN detected in DiTDenoiser forward")
+        if return_ads_components and self.cfg.use_ads_center_rel_head:
+            return {
+                "pred_x1": pred_x_1,
+                "ads_center": ads_center,
+                "ads_rel_pos": ads_rel,
+            }
         return pred_x_1

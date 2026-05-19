@@ -142,6 +142,91 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "use_ads_ref_pos": True,
         "use_ads_specific_head": True,
     },
+    # ~2x parameter-count version of v0-ads-ref-adshead. Width is scaled
+    # 512→640 and pair width 256→320 while preserving 128-dim attention heads
+    # (4/8/4 heads → 5/10/5). Trunk depth 16→22 brings the total to ~206M
+    # parameters, i.e. ~2.02x the 101.9M base.
+    "v0-ads-ref-adshead-2x": {
+        "atom_s": 640, "atom_z": 320,
+        "token_s": 640, "token_z": 320,
+        "enc_depth": 2, "trunk_depth": 22, "dec_depth": 2,
+        "enc_heads": 5, "trunk_heads": 10, "dec_heads": 5,
+        "skip_stage_gates": True,
+        "dec_pair_bias": True, "dist_kernel": "gaussian",
+        "dist_rbf_num": 16, "dist_rbf_cutoff": 6.0,
+        "use_ads_ref_pos": True,
+        "use_ads_specific_head": True,
+    },
+    # v0-ads-ref-adshead-2x + lightweight fixed preconditioning.
+    # Only x_t (input to xt_proj) and the model's coord output are scaled by
+    # coord_scale; pos (x_0) and ads_ref_pos stay raw Å. coord_scale=4.0 is
+    # roughly Å→nm with a softer 4 Å unit so adsorbate sub-Å detail is not
+    # squashed.
+    "v0-ads-ref-adshead-2x-fixedscale": {
+        "atom_s": 640, "atom_z": 320,
+        "token_s": 640, "token_z": 320,
+        "enc_depth": 2, "trunk_depth": 22, "dec_depth": 2,
+        "enc_heads": 5, "trunk_heads": 10, "dec_heads": 5,
+        "skip_stage_gates": True,
+        "dec_pair_bias": True, "dist_kernel": "gaussian",
+        "dist_rbf_num": 16, "dist_rbf_cutoff": 6.0,
+        "use_ads_ref_pos": True,
+        "use_ads_specific_head": True,
+        "coord_norm_mode": "fixedscale",
+        "coord_mean": (0.0, 0.0, 0.0),
+        "coord_scale": (4.0, 4.0, 4.0),
+        # ads_ref / pair stay raw — these fields are unused by the model and
+        # are kept identity to make args.json reflect the actual behavior.
+        "ads_ref_mean": (0.0, 0.0, 0.0),
+        "ads_ref_scale": (1.0, 1.0, 1.0),
+    },
+    # v0-ads-ref-adshead-2x + train-set coordinate statistics for x_t/output.
+    # coord_scale uses x1 all-atom std from is2res_train_unwrap_centered.
+    # pos (x_0) and ads_ref_pos stay raw Å; ads_ref_* fields are unused.
+    "v0-ads-ref-adshead-2x-statnorm": {
+        "atom_s": 640, "atom_z": 320,
+        "token_s": 640, "token_z": 320,
+        "enc_depth": 2, "trunk_depth": 22, "dec_depth": 2,
+        "enc_heads": 5, "trunk_heads": 10, "dec_heads": 5,
+        "skip_stage_gates": True,
+        "dec_pair_bias": True, "dist_kernel": "gaussian",
+        "dist_rbf_num": 16, "dist_rbf_cutoff": 6.0,
+        "use_ads_ref_pos": True,
+        "use_ads_specific_head": True,
+        "coord_norm_mode": "statnorm",
+        "coord_mean": (0.0, 0.0, 0.0),
+        "coord_scale": (3.57, 4.09, 3.71),
+        # ads_ref / pair stay raw — fields kept identity for clarity.
+        "ads_ref_mean": (0.0, 0.0, 0.0),
+        "ads_ref_scale": (1.0, 1.0, 1.0),
+    },
+    # Same H200 statnorm backbone, but CatFlow-style adsorbate coordinate
+    # factorization: decoder predicts ads center from pooled ads tokens and
+    # ads rel-pos from per-ads-token features, then assembles center + rel.
+    "v0-ads-ref-2x-statnorm-catflow-center-rel": {
+        "atom_s": 640, "atom_z": 320,
+        "token_s": 640, "token_z": 320,
+        "enc_depth": 2, "trunk_depth": 22, "dec_depth": 2,
+        "enc_heads": 5, "trunk_heads": 10, "dec_heads": 5,
+        "skip_stage_gates": True,
+        "dec_pair_bias": True, "dist_kernel": "gaussian",
+        "dist_rbf_num": 16, "dist_rbf_cutoff": 6.0,
+        "use_ads_ref_pos": True,
+        "use_ads_specific_head": False,
+        "use_ads_center_rel_head": True,
+        "coord_norm_mode": "statnorm",
+        "coord_mean": (0.0, 0.0, 0.0),
+        "coord_scale": (3.57, 4.09, 3.71),
+        "ads_ref_mean": (0.0, 0.0, 0.0),
+        "ads_ref_scale": (1.0, 1.0, 1.0),
+        "ads_center_mean": (-0.4249, -0.0863, 5.8592),
+        "ads_center_scale": (2.9450, 3.2665, 1.7597),
+        "ads_rel_pos_mean": (0.0, 0.0, 0.0),
+        "ads_rel_pos_scale": (0.6319, 0.8760, 0.7194),
+        # CatFlow enforces sum-to-zero in the rel-pos prior; the decoder head
+        # itself is trained toward mean-zero rel-pos rather than hard-projected.
+        "ads_rel_output_sum_zero": False,
+    },
     # v0-ads-ref + dynamic pair distance from x_t (the noisy intermediate),
     # WITH the original MIC convention applied to pair displacements.
     # Tests whether letting pair features see the current sample state
