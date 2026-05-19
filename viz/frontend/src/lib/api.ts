@@ -39,16 +39,21 @@ async function json<T>(url: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+// API paths are RELATIVE (no leading "/") so the app works when served under a
+// reverse-proxy subpath (e.g. code-server's /proxy/3000/). A leading "/" would
+// resolve against the host root and bypass the Next.js /api rewrite.
+const API = "api";
+
 export const api = {
-  health: () => json<{ ok: boolean; viz_root: string; viz_root_exists: boolean }>("/api/health"),
-  epochs: () => json<{ epochs: EpochInfo[]; count: number }>("/api/epochs"),
-  systems: (epoch: number) => json<SystemsIndex>(`/api/epochs/${epoch}/systems`),
-  meta: (epoch: number, sys: number) => json<SystemMeta>(`/api/epochs/${epoch}/systems/${sys}/meta`),
-  data: (epoch: number, sys: number) => json<PerStepData>(`/api/epochs/${epoch}/systems/${sys}/data`),
+  health: () => json<{ ok: boolean; viz_root: string; viz_root_exists: boolean }>(`${API}/health`),
+  epochs: () => json<{ epochs: EpochInfo[]; count: number }>(`${API}/epochs`),
+  systems: (epoch: number) => json<SystemsIndex>(`${API}/epochs/${epoch}/systems`),
+  meta: (epoch: number, sys: number) => json<SystemMeta>(`${API}/epochs/${epoch}/systems/${sys}/meta`),
+  data: (epoch: number, sys: number) => json<PerStepData>(`${API}/epochs/${epoch}/systems/${sys}/data`),
   // For "traj" the backend returns a multi-model PDB regardless of source
   // format (preferred .pdb on disk, falls back to converting .xyz).
   structureUrl: (epoch: number, sys: number, kind: "x0" | "x1_flow" | "x1_relaxed" | "traj") =>
-    `/api/epochs/${epoch}/systems/${sys}/structure/${kind}`,
+    `${API}/epochs/${epoch}/systems/${sys}/structure/${kind}`,
 };
 
 export async function fetchText(url: string): Promise<string> {

@@ -183,6 +183,11 @@ def main():
         e["sys_dir_name"] = new_name
         e["shard_idx"] = -1
         e["redo"] = True
+        # Re-assign a unique global_idx: each viz-redo run numbers its systems
+        # from 0, so appending without renumbering collides with existing
+        # entries and the backend's global_idx lookup resolves them all to the
+        # first match. Number sequentially across the merged index instead.
+        e["global_idx"] = len(final_idx["systems"])
         final_idx["systems"].append(e)
     final_idx["n_systems"] = len(final_idx["systems"])
     with open(dst_idx, "w") as f:

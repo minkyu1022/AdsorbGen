@@ -11,9 +11,9 @@
 
 set -euo pipefail
 
-REPO=/home/minkyu/Cat-bench
-PYTHON=/home/minkyu/micromamba/envs/adsorbRL/bin/python3
-VIZ_ROOT_DEFAULT=${REPO}/runs/full_v0_ads_ref_x1_l1_allpairL1ref1_noreplay/replay_viz
+REPO=/home/irteam/AdsorbGen
+PYTHON=/home/irteam/micromamba/envs/adsorbgen/bin/python3
+VIZ_ROOT_DEFAULT=/home/irteam/runs/H200_ads_pair_dist_loss/replay_viz
 
 cmd="${1:-help}"
 
@@ -27,12 +27,12 @@ case "${cmd}" in
     export REPLAY_VIZ_ROOT="${REPLAY_VIZ_ROOT:-${VIZ_ROOT_DEFAULT}}"
     cd "${REPO}"
     exec "${PYTHON}" -m uvicorn viz.backend.main:app \
-        --host 0.0.0.0 --port 8000 --reload
+        --host 0.0.0.0 --port "${VIZ_PORT:-8000}" --reload
     ;;
 
   frontend)
     cd "${REPO}/viz/frontend"
-    export NEXT_PUBLIC_BACKEND_URL="${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8000}"
+    export NEXT_PUBLIC_BACKEND_URL="${NEXT_PUBLIC_BACKEND_URL:-http://localhost:${VIZ_PORT:-8000}}"
     exec npm run dev
     ;;
 
