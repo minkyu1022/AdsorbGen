@@ -68,6 +68,9 @@ The current long-running workflow is:
 
 Optional derived MLIP-relaxed LMDBs can be built separately by setting
 `BUILD_MLIP_LMDBS=1` when running the finalize script. By default this is off.
+For the current `max_steps=500` reconvergence run, the active finalize watcher
+was launched with `BUILD_MLIP_LMDBS=1`, so it will create
+`/home/irteam/data/processed_mlip_oc20/*.lmdb` after rebuilding the final refs.
 
 ## Dropbox Upload
 
