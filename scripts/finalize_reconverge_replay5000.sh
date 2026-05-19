@@ -55,6 +55,11 @@ echo "[finalize5000] reconverge finished $(date -Is); rebuilding merged E_sys/GT
   --out-dir "$OUT_DIR" \
   --old-gt-index "$OUT_DIR/gt_index_by_sid.pkl"
 
+echo "[finalize5000] writing E_sys convergence-step statistics"
+"$PYTHON_BIN" scripts/report_e_sys_steps.py \
+  --e-sys "$OUT_DIR/E_sys.pkl" \
+  --out "$OUT_DIR/E_sys_step_stats.json"
+
 echo "[finalize5000] building MLIP-relaxed training LMDBs"
 "$PYTHON_BIN" scripts/build_mlip_relaxed_lmdbs.py \
   --e-sys "$OUT_DIR/E_sys.pkl" \
@@ -129,6 +134,7 @@ mkdir -p "$UPLOAD_STAGE"
 cp "$OUT_DIR/E_sys.pkl" \
    "$OUT_DIR/gt_index_by_sid_oc20.pkl" \
    "$OUT_DIR/gt_index_by_system_oc20.pkl" \
+   "$OUT_DIR/E_sys_step_stats.json" \
    "$STREAM_DIR/cycle_000000_report.json" \
    "$UPLOAD_STAGE"/
 cp "${OUT_DIR}/finalize_reconverge_replay5000_${STAMP}.log" "$UPLOAD_STAGE"/
