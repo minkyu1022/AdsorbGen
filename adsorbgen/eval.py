@@ -45,6 +45,19 @@ import torch
 # pristine DB without needing to pickle it across the pool boundary.
 _PRISTINE_CTX: dict = {"db": None, "sid_to_key": None, "system_to_key": None}
 
+# Lazy-loaded adsorbates.pkl for canonical-bond-graph dissoc reference.
+_ADS_DB_CTX: dict = {"db": None, "path": "/home/irteam/data/pkls/adsorbates.pkl"}
+
+
+def _load_ads_db():
+    if _ADS_DB_CTX["db"] is None:
+        try:
+            with open(_ADS_DB_CTX["path"], "rb") as f:
+                _ADS_DB_CTX["db"] = pickle.load(f)
+        except Exception:
+            _ADS_DB_CTX["db"] = {}
+    return _ADS_DB_CTX["db"]
+
 
 def _split_pristine_index(index: dict) -> tuple[dict, dict]:
     sid_to_key = {}
@@ -287,8 +300,37 @@ def _score_record_anomaly(record: Dict) -> Dict:
     result["has_overlap"] = bool(pair_min < OVERLAP_MIN_DIST_A)
     result["min_pair_distance_A"] = pair_min
 
+    # Build a canonical-reference init_atoms for the dissoc bond-graph check.
+    # x_0 from a non-rigid prior (e.g. CatFlow Gaussian rel-pos) does not have
+    # a valid molecular bond graph, so the init-vs-final comparison was a
+    # massive source of false positives. When ads_id is available, replace ads
+    # positions in init with the gas-phase canonical geometry from
+    # adsorbates.pkl; this leaves the comparison meaningful regardless of
+    # prior. Falls back silently if ads_id absent or atom order mismatched.
+    ads_id = int(record.get("ads_id", -1)) if record.get("ads_id") is not None else -1
+    init_atoms_diss = init_atoms
+    if ads_id >= 0:
+        db = _load_ads_db()
+        entry = db.get(ads_id)
+        if entry is not None:
+            canon_atoms = entry[0]
+            canon_z = np.asarray(canon_atoms.get_atomic_numbers(), dtype=np.int64)
+            ads_mask = (tags_np == 2)
+            rec_ads_z = np.asarray(record["atomic_numbers"].numpy(), dtype=np.int64)[ads_mask]
+            if canon_z.size == rec_ads_z.size and np.array_equal(canon_z, rec_ads_z):
+                from ase import Atoms as _Atoms
+                init_pos = init_atoms.get_positions().copy()
+                init_pos[ads_mask] = canon_atoms.get_positions()
+                init_atoms_diss = _Atoms(
+                    numbers=init_atoms.get_atomic_numbers(),
+                    positions=init_pos,
+                    cell=init_atoms.cell,
+                    pbc=init_atoms.pbc,
+                )
+                init_atoms_diss.set_tags(tags_np.tolist())
+
     det = DetectTrajAnomaly(
-        init_atoms=init_atoms,
+        init_atoms=init_atoms_diss,
         final_atoms=final_atoms,
         atoms_tag=tags_np.tolist(),
         final_slab_atoms=final_slab_atoms,

@@ -23,6 +23,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 from datetime import timedelta
 
@@ -57,7 +58,7 @@ from adsorbgen.flow import (  # noqa: E402
 from adsorbgen.model import DiTDenoiserConfig  # noqa: E402
 from adsorbgen.model_factory import build_model  # noqa: E402
 from adsorbgen.model_v2 import DiTDenoiserV2Config  # noqa: E402
-from adsorbgen.replay import ReplayBuffer  # noqa: E402
+from adsorbgen.replay import ReplayBuffer, ReplayStreamReader  # noqa: E402
 from adsorbgen.variants import get_variant, list_variants  # noqa: E402
 
 
@@ -89,6 +90,8 @@ class AdsorbGenModule(L.LightningModule):
         ads_nonbonded_clash_weight: float = 0.0,
         ads_bond_factor: float = 1.25,
         ads_clash_factor: float = 0.75,
+        ads_center_loss_weight: float = 1.0,
+        ads_rel_pos_loss_weight: float = 1.0,
         # --- replay params ---
         use_replay: bool = False,
         replay_buffer_path: str = "",      # runs/<out>/replay_buffer.pkl
@@ -112,6 +115,9 @@ class AdsorbGenModule(L.LightningModule):
         replay_uma_max_steps: int = 100,
         replay_flow_steps: int = 50,
         replay_overlap_threshold: float = 0.5,
+        # --- external replay daemon consumer ---
+        external_replay_dir: str = "",
+        external_replay_reload_every_n_epochs: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -127,6 +133,36 @@ class AdsorbGenModule(L.LightningModule):
         self._replay_buffer = None
         self._replay_scheduler = None
         self._replay_gt_index = None
+        # External replay-stream consumer (set when --external-replay-dir
+        # is provided). Mutually exclusive with the in-training --use-replay
+        # epoch_end hook: in external mode we do not run replay on the
+        # training GPUs; we only consume entries that a separate daemon
+        # produced into ``external_replay_dir``.
+        self._external_replay_dir = str(external_replay_dir or "")
+        self._external_replay_reader: Optional[ReplayStreamReader] = None
+        self._external_replay_reload_every = int(external_replay_reload_every_n_epochs)
+        if self._external_replay_dir:
+            if use_replay:
+                raise ValueError(
+                    "external_replay_dir is mutually exclusive with --use-replay; "
+                    "disable in-training replay when consuming an external stream."
+                )
+            self._replay_buffer = ReplayBuffer(
+                mode=replay_mode, per_system_cap=replay_per_system_cap,
+                global_cap=replay_cap, weight_mode=replay_weight_mode,
+            )
+            self._external_replay_reader = ReplayStreamReader(Path(self._external_replay_dir))
+            initial_entries = self._external_replay_reader.load_new_chunks()
+            n_initial = 0
+            for entry in initial_entries:
+                if self._replay_buffer.add(entry):
+                    n_initial += 1
+            print(
+                f"[replay] external consumer: dir={self._external_replay_dir} "
+                f"reload_every={self._external_replay_reload_every}ep "
+                f"initial_entries={len(initial_entries)} accepted={n_initial}",
+                flush=True,
+            )
         # Tracks the epoch (`current_epoch`) at which the most recent replay
         # eval *successfully completed*. Persisted via on_save_checkpoint, so
         # if a run is killed mid-replay (or mid-epoch after a replay), the
@@ -190,6 +226,10 @@ class AdsorbGenModule(L.LightningModule):
         self.log("train/loss_unweighted", losses["total"])      # all-movable mean, reference
         self.log("train/surf_loss", losses["surf"])
         self.log("train/ads_loss", losses["ads"])
+        if "ads_center" in losses:
+            self.log("train/ads_center_loss", losses["ads_center"])
+        if "ads_rel_pos" in losses:
+            self.log("train/ads_rel_pos_loss", losses["ads_rel_pos"])
         if "lddt_ads_ads" in losses:
             self.log("train/lddt_ads_ads_loss", losses["lddt_ads_ads"])
         if "ads_pair_l1" in losses:
@@ -218,6 +258,10 @@ class AdsorbGenModule(L.LightningModule):
         self.log(f"val/{src}/loss_unweighted", losses["total"], sync_dist=True, add_dataloader_idx=False)
         self.log(f"val/{src}/surf_loss", losses["surf"], sync_dist=True, add_dataloader_idx=False)
         self.log(f"val/{src}/ads_loss", losses["ads"], sync_dist=True, add_dataloader_idx=False)
+        if "ads_center" in losses:
+            self.log(f"val/{src}/ads_center_loss", losses["ads_center"], sync_dist=True, add_dataloader_idx=False)
+        if "ads_rel_pos" in losses:
+            self.log(f"val/{src}/ads_rel_pos_loss", losses["ads_rel_pos"], sync_dist=True, add_dataloader_idx=False)
         if "lddt_ads_ads" in losses:
             self.log(f"val/{src}/lddt_ads_ads_loss", losses["lddt_ads_ads"], sync_dist=True, add_dataloader_idx=False)
         if "ads_pair_l1" in losses:
@@ -242,6 +286,9 @@ class AdsorbGenModule(L.LightningModule):
     # -- replay hook --
     def on_train_epoch_end(self):
         hp = self.hparams
+        if self._external_replay_reader is not None:
+            self._consume_external_replay()
+            return
         if not hp.use_replay:
             return
         ep = self.current_epoch
@@ -331,6 +378,43 @@ class AdsorbGenModule(L.LightningModule):
         # trigger fires `replay_eval_every` epochs later. Done after the
         # barrier so a kill mid-replay doesn't advance the counter.
         self._last_replay_epoch = ep
+
+    def _consume_external_replay(self):
+        """Ingest new chunks from the external replay daemon into the
+        in-memory ReplayBuffer. Runs on every rank at epoch end so all DDP
+        ranks see the same buffer state when dataloaders are rebuilt.
+
+        Frequency is governed by ``external_replay_reload_every_n_epochs``
+        from epoch 0; reload always runs on the very first epoch end so the
+        very first training epoch can already see any pre-existing entries.
+        """
+        reader = self._external_replay_reader
+        buffer = self._replay_buffer
+        if reader is None or buffer is None:
+            return
+        every = max(1, self._external_replay_reload_every)
+        ep = self.current_epoch
+        if (ep + 1) % every != 0:
+            return
+        try:
+            entries = reader.load_new_chunks()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[replay] external reader failed: {exc}", flush=True)
+            return
+        n_added = 0
+        for entry in entries:
+            if buffer.add(entry):
+                n_added += 1
+        if self.global_rank == 0:
+            print(
+                f"[replay] external: epoch {ep+1} loaded {len(entries)} "
+                f"new entries ({n_added} accepted) buf={len(buffer)} "
+                f"systems={buffer.n_systems()}",
+                flush=True,
+            )
+        self.log("replay_buf/size", float(len(buffer)), rank_zero_only=True)
+        self.log("replay_buf/n_systems", float(buffer.n_systems()), rank_zero_only=True)
+        self.log("replay_buf/new_entries_loaded", float(len(entries)), rank_zero_only=True)
 
     def on_save_checkpoint(self, checkpoint):
         # Persist replay schedule state across resume.
@@ -462,6 +546,20 @@ class AdsorbGenModule(L.LightningModule):
 
         t = sample_t(pos.shape[0], self.flow_cfg, device=pos.device, dtype=pos.dtype)
         x_t = interpolate_xt(pos, pos_rel, t, movable)
+        use_center_rel = bool(getattr(self._model_cfg(), "use_ads_center_rel_head", False))
+        ads_center_1 = ads_rel_pos_1 = None
+        if use_center_rel:
+            ads_mask = movable & (tags == 2)
+            ads_center_0 = self._masked_ads_center(pos, ads_mask)
+            ads_center_1 = self._masked_ads_center(pos_rel, ads_mask)
+            ads_rel_pos_0 = (pos - ads_center_0[:, None, :]) * ads_mask.unsqueeze(-1).to(pos.dtype)
+            ads_rel_pos_1 = (pos_rel - ads_center_1[:, None, :]) * ads_mask.unsqueeze(-1).to(pos.dtype)
+            t_center = t[:, None].to(pos.dtype)
+            t_rel = t[:, None, None].to(pos.dtype)
+            ads_center_t = (1.0 - t_center) * ads_center_0 + t_center * ads_center_1
+            ads_rel_pos_t = (1.0 - t_rel) * ads_rel_pos_0 + t_rel * ads_rel_pos_1
+            ads_f = ads_mask.unsqueeze(-1).to(pos.dtype)
+            x_t = x_t * (1.0 - ads_f) + (ads_center_t[:, None, :] + ads_rel_pos_t) * ads_f
 
         model_kwargs = dict(
             pos=pos, x_t=x_t, t=t,
@@ -469,6 +567,10 @@ class AdsorbGenModule(L.LightningModule):
             movable_mask=movable, pad_mask=batch["pad_mask"],
             cell=cell,
         )
+        if use_center_rel:
+            model_kwargs["ads_center_t"] = ads_center_t
+            model_kwargs["ads_rel_pos_t"] = ads_rel_pos_t
+            model_kwargs["return_ads_components"] = True
         if getattr(self._model_cfg(), "use_ads_ref_pos", False):
             model_kwargs["ads_ref_pos"] = batch["ads_ref_pos"]
 
@@ -478,17 +580,24 @@ class AdsorbGenModule(L.LightningModule):
             model_kwargs["prev_pred"] = prev
 
         pred = self.model(**model_kwargs)
-        losses = flow_loss_split(
-            pred, pos, pos_rel, movable, tags,
-            loss_type=self.hparams.loss_type,
-            prediction_type=self.flow_cfg.prediction_type,
-        )
+        if use_center_rel:
+            losses = self._flow_loss_split_ads_center_rel(
+                pred, pos, pos_rel, movable, tags,
+                ads_center_1=ads_center_1,
+                ads_rel_pos_1=ads_rel_pos_1,
+            )
+        else:
+            losses = flow_loss_split(
+                pred, pos, pos_rel, movable, tags,
+                loss_type=self.hparams.loss_type,
+                prediction_type=self.flow_cfg.prediction_type,
+            )
         lddt_w = float(getattr(self.hparams, "lddt_ads_ads_weight", 0.0))
         if lddt_w != 0.0:
             if self.flow_cfg.prediction_type == "x1":
-                pred_x1 = pred
+                pred_x1 = pred["pred_x1"] if isinstance(pred, dict) else pred
             elif self.flow_cfg.prediction_type == "v":
-                pred_x1 = pos + pred
+                pred_x1 = pos + (pred["pred_x1"] if isinstance(pred, dict) else pred)
             else:
                 raise ValueError(f"Unknown prediction_type={self.flow_cfg.prediction_type!r}")
             ads_mask = movable & (tags == 2)
@@ -507,9 +616,9 @@ class AdsorbGenModule(L.LightningModule):
         )
         if any(w != 0.0 for w in pair_ws):
             if self.flow_cfg.prediction_type == "x1":
-                pred_x1 = pred
+                pred_x1 = pred["pred_x1"] if isinstance(pred, dict) else pred
             elif self.flow_cfg.prediction_type == "v":
-                pred_x1 = pos + pred
+                pred_x1 = pos + (pred["pred_x1"] if isinstance(pred, dict) else pred)
             else:
                 raise ValueError(f"Unknown prediction_type={self.flow_cfg.prediction_type!r}")
             ads_mask = movable & (tags == 2)
@@ -524,12 +633,112 @@ class AdsorbGenModule(L.LightningModule):
             ))
         return losses
 
+    def _flow_loss_split_ads_center_rel(
+        self,
+        pred,
+        pos,
+        pos_rel,
+        movable,
+        tags,
+        ads_center_1,
+        ads_rel_pos_1,
+    ):
+        pred_components = pred
+        pred = pred_components["pred_x1"]
+        if self.flow_cfg.prediction_type == "v":
+            pred_x1 = pos + pred
+        elif self.flow_cfg.prediction_type == "x1":
+            pred_x1 = pred
+        else:
+            raise ValueError(f"Unknown prediction_type={self.flow_cfg.prediction_type!r}")
+
+        surf_mask = movable & (tags == 1)
+        ads_mask = movable & (tags == 2)
+
+        surf_losses = flow_loss_split(
+            pred, pos, pos_rel, surf_mask, tags,
+            loss_type=self.hparams.loss_type,
+            prediction_type=self.flow_cfg.prediction_type,
+        )
+        ads_center, ads_rel = self._ads_center_rel_output_losses(
+            pred_components["ads_center"],
+            pred_components["ads_rel_pos"],
+            ads_center_1,
+            ads_rel_pos_1,
+            ads_mask,
+            loss_type=self.hparams.loss_type,
+        )
+        ads = ads_center + ads_rel
+        return {
+            "total": surf_losses["surf"] + ads,
+            "surf": surf_losses["surf"],
+            "ads": ads,
+            "ads_center": ads_center,
+            "ads_rel_pos": ads_rel,
+        }
+
+    @staticmethod
+    def _masked_ads_center(coords, ads_mask):
+        w = ads_mask.unsqueeze(-1).to(coords.dtype)
+        return (coords * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+
+    def _ads_center_rel_losses(self, pred_x1, target_x1, ads_mask, loss_type: str):
+        pred_center = self._masked_ads_center(pred_x1, ads_mask)
+        true_center = self._masked_ads_center(target_x1, ads_mask)
+        pred_rel = (pred_x1 - pred_center[:, None, :]) * ads_mask.unsqueeze(-1).to(pred_x1.dtype)
+        true_rel = (target_x1 - true_center[:, None, :]) * ads_mask.unsqueeze(-1).to(target_x1.dtype)
+
+        if loss_type == "l1":
+            center_per = (pred_center - true_center).abs().mean(dim=1)
+            rel_per_atom = (pred_rel - true_rel).abs().sum(dim=-1)
+        else:
+            center_per = (pred_center - true_center).pow(2).mean(dim=1)
+            rel_per_atom = (pred_rel - true_rel).pow(2).sum(dim=-1)
+
+        denom = ads_mask.to(pred_x1.dtype).sum(dim=1)
+        has_ads = denom > 0
+        rel_per = (rel_per_atom * ads_mask.to(pred_x1.dtype)).sum(dim=1) / denom.clamp_min(1.0)
+        if has_ads.any():
+            return center_per[has_ads].mean(), rel_per[has_ads].mean()
+        z = pred_x1.new_tensor(0.0)
+        return z, z
+
+    def _ads_center_rel_output_losses(
+        self,
+        pred_center,
+        pred_rel,
+        true_center,
+        true_rel,
+        ads_mask,
+        loss_type: str,
+    ):
+        if loss_type == "l1":
+            center_per = (pred_center - true_center).abs().mean(dim=1)
+            rel_per_atom = (pred_rel - true_rel).abs().sum(dim=-1)
+        else:
+            center_per = (pred_center - true_center).pow(2).mean(dim=1)
+            rel_per_atom = (pred_rel - true_rel).pow(2).sum(dim=-1)
+
+        denom = ads_mask.to(pred_rel.dtype).sum(dim=1)
+        has_ads = denom > 0
+        rel_per = (rel_per_atom * ads_mask.to(pred_rel.dtype)).sum(dim=1) / denom.clamp_min(1.0)
+        if has_ads.any():
+            return center_per[has_ads].mean(), rel_per[has_ads].mean()
+        z = pred_rel.new_tensor(0.0)
+        return z, z
+
     def _compute_loss(self, batch):
         return self._compute_loss_split(batch)["total"]
 
     def _weighted_coord_loss(self, losses):
         sw = float(self.hparams.loss_surf_weight)
         aw = float(self.hparams.loss_ads_weight)
+        if "ads_center" in losses and "ads_rel_pos" in losses:
+            cw = float(getattr(self.hparams, "ads_center_loss_weight", 1.0))
+            rw = float(getattr(self.hparams, "ads_rel_pos_loss_weight", 1.0))
+            return sw * losses["surf"] + aw * (
+                cw * losses["ads_center"] + rw * losses["ads_rel_pos"]
+            )
         return sw * losses["surf"] + aw * losses["ads"]
 
     def _weighted_loss(self, losses):
@@ -596,10 +805,12 @@ class AdsorbGenModule(L.LightningModule):
             sid_i = int(batch["sid"][i].item()) if "sid" in batch else -1
             system_key_i = batch.get("system_key", [None] * B)[i]
             config_key_i = batch.get("config_key", [None] * B)[i]
+            ads_id_i = int(batch["ads_id"][i].item()) if "ads_id" in batch else -1
             recs.append({
                 "sid": sid_i,
                 "system_key": system_key_i,
                 "config_key": config_key_i,
+                "ads_id": ads_id_i,
                 "pos_pred": x_out[i, :n].cpu(),
                 "pos_gt": batch["pos_relaxed"][i, :n].cpu(),
                 "pos_ref": batch["pos"][i, :n].cpu(),
@@ -645,7 +856,8 @@ class AdsorbGenDataModule(L.LightningDataModule):
         replicate = int(getattr(a, "train_replicate", 1) or 1)
         if replicate > 1:
             self._train_base = ConcatDataset([self._train_base] * replicate)
-        if getattr(a, "use_replay", False) and self.replay_buffer is not None:
+        external_replay_on = bool(getattr(a, "external_replay_dir", "") or "")
+        if (getattr(a, "use_replay", False) or external_replay_on) and self.replay_buffer is not None:
             # Pick any PlacementPriorDataset as placement helper for replay
             # sample construction (works with both single and ConcatDataset).
             helper = train_parts[0]
@@ -670,6 +882,7 @@ class AdsorbGenDataModule(L.LightningDataModule):
                 a.val_lmdb,
                 max_samples=a.max_val_samples,
                 training_aug=False,
+                unique_by_system_key=True,
                 prior_mode=getattr(a, "prior_mode", "random_heuristic"),
                 interstitial_gap=getattr(a, "interstitial_gap", 0.1),
                 provide_ads_ref_pos=provide_ref,
@@ -849,12 +1062,17 @@ def main():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--save-every-n-epochs", type=int, default=1,
+                   help="archival ckpt save frequency (epochs). save_last is always on.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=10.0)
     p.add_argument("--accumulate-grad-batches", type=int, default=1)
     p.add_argument("--lr-warmup-steps", type=int, default=500)
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--precision", type=str, default="32-true",
+                   choices=["32-true", "bf16-mixed", "16-mixed"],
+                   help="Lightning precision setting. Use bf16-mixed on H200.")
     p.add_argument("--devices", type=int, default=None,
                    help="number of GPUs (default: auto-detect)")
 
@@ -868,9 +1086,13 @@ def main():
     p.add_argument("--activation-checkpointing", action="store_true")
     p.add_argument("--translation-std", type=float, default=0.5)
     p.add_argument("--prior-mode",
-                   choices=["random", "heuristic", "random_heuristic"],
+                   choices=[
+                       "random", "heuristic", "random_heuristic",
+                       "harmonic_uniform", "harmonic_centered",
+                       "catflow_center_rel",
+                   ],
                    default="random_heuristic",
-                   help="Placement prior for x_0: fairchem placement mode")
+                   help="Placement prior for x_0: fairchem placement mode or custom ads prior")
     p.add_argument("--interstitial-gap", type=float, default=0.1,
                    help="fairchem placement interstitial gap (Å)")
     p.add_argument("--variant", type=str, default="v2",
@@ -900,6 +1122,10 @@ def main():
                    help="covalent-radius multiplier for inferring adsorbate bonds")
     p.add_argument("--ads-clash-factor", type=float, default=0.75,
                    help="covalent-radius multiplier for nonbonded clash lower bounds")
+    p.add_argument("--ads-center-loss-weight", type=float, default=1.0,
+                   help="CatFlow-style ads center loss weight when using a center/rel output head")
+    p.add_argument("--ads-rel-pos-loss-weight", type=float, default=1.0,
+                   help="CatFlow-style ads relative-position loss weight when using a center/rel output head")
     p.add_argument("--flow-eps", type=float, default=1e-5)
     p.add_argument("--prediction-type", type=str, default="x1",
                    choices=["x1", "v"],
@@ -923,6 +1149,11 @@ def main():
 
     # Replay buffer (expert iteration)
     p.add_argument("--use-replay", action="store_true")
+    p.add_argument("--external-replay-dir", type=str, default="",
+                   help="consume success entries written by an external replay daemon "
+                        "(scripts/replay_daemon.py). Mutually exclusive with --use-replay.")
+    p.add_argument("--external-replay-reload-every-n-epochs", type=int, default=1,
+                   help="how often (in epochs) to reload new chunks from --external-replay-dir.")
     p.add_argument("--replay-gt-index",
                    default=str(_PROJECT_ROOT / "data" / "replay" / "gt_index_by_sid.pkl"))
     p.add_argument("--replay-train-lmdb", type=str, default=None,
@@ -995,6 +1226,7 @@ def main():
             "devices": _args_d.get("devices"),
             "lr": _args_d.get("lr"),
             "lr_warmup_steps": _args_d.get("lr_warmup_steps"),
+            "precision": _args_d.get("precision"),
             "weight_decay": _args_d.get("weight_decay"),
             "grad_clip": _args_d.get("grad_clip"),
             "accumulate_grad_batches": _args_d.get("accumulate_grad_batches"),
@@ -1007,6 +1239,8 @@ def main():
             "ads_nonbonded_clash_weight": _args_d.get("ads_nonbonded_clash_weight"),
             "ads_bond_factor": _args_d.get("ads_bond_factor"),
             "ads_clash_factor": _args_d.get("ads_clash_factor"),
+            "ads_center_loss_weight": _args_d.get("ads_center_loss_weight"),
+            "ads_rel_pos_loss_weight": _args_d.get("ads_rel_pos_loss_weight"),
             "flow_eps": _args_d.get("flow_eps"),
             "activation_checkpointing": _args_d.get("activation_checkpointing"),
             "seed": _args_d.get("seed"),
@@ -1112,6 +1346,8 @@ def main():
         ads_nonbonded_clash_weight=args.ads_nonbonded_clash_weight,
         ads_bond_factor=args.ads_bond_factor,
         ads_clash_factor=args.ads_clash_factor,
+        ads_center_loss_weight=args.ads_center_loss_weight,
+        ads_rel_pos_loss_weight=args.ads_rel_pos_loss_weight,
         use_replay=args.use_replay,
         replay_buffer_path=replay_buffer_path,
         replay_gt_index_path=args.replay_gt_index if args.use_replay else "",
@@ -1134,6 +1370,10 @@ def main():
         replay_uma_max_steps=args.replay_uma_max_steps,
         replay_flow_steps=args.replay_flow_steps,
         replay_overlap_threshold=args.replay_overlap_threshold,
+        external_replay_dir=getattr(args, "external_replay_dir", "") or "",
+        external_replay_reload_every_n_epochs=int(
+            getattr(args, "external_replay_reload_every_n_epochs", 1)
+        ),
     )
 
     if last_ckpt.exists():
@@ -1148,7 +1388,7 @@ def main():
             dirpath=str(out_dir),
             filename="ckpt_epoch{epoch:03d}",
             save_last=True,
-            every_n_epochs=1,
+            every_n_epochs=int(getattr(args, "save_every_n_epochs", 1)),
             save_top_k=-1,
         ),
         RichModelSummary(max_depth=2),
@@ -1182,9 +1422,9 @@ def main():
         n_gpus = 1  # single-GPU is enough for a one-pass validation
     else:
         n_gpus = args.devices or torch.cuda.device_count() or 1
-    # When replay is on, dataloaders must refresh after each eval so workers
-    # see the updated buffer state.
-    reload_every = 1 if args.use_replay else 0
+    # When replay is on (in-training OR external daemon), dataloaders must
+    # refresh after each epoch end so workers see the updated buffer state.
+    reload_every = 1 if (args.use_replay or getattr(args, "external_replay_dir", "")) else 0
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
@@ -1197,6 +1437,7 @@ def main():
         callbacks=callbacks,
         logger=logger,
         gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+        precision=args.precision,
         default_root_dir=str(out_dir),
         log_every_n_steps=args.log_every,
         enable_progress_bar=True,

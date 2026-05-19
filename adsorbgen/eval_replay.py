@@ -60,6 +60,7 @@ def _passes_anomaly(
     tags: np.ndarray,
     cell: np.ndarray,
     sid: int,
+    ads_id: int = -1,
 ) -> tuple:
     """Validation-equivalent 5-axis anomaly check.
 
@@ -67,7 +68,10 @@ def _passes_anomaly(
     *same* anomaly definition as the sample_eval/validation pipeline:
       * overlap:  MIC min-pair distance < 0.5 Å (``OVERLAP_MIN_DIST_A``)
       * dissoc / desorbed / intercalated / surf_changed:
-            fairchem ``DetectTrajAnomaly`` (not phase3's reimplementation)
+            fairchem ``DetectTrajAnomaly`` (not phase3's reimplementation).
+            ``ads_id`` is forwarded so the dissoc bond-graph check uses the
+            canonical gas-phase adsorbate geometry as init reference, instead
+            of the (bond-graph-invalid) prior x_0 — matching validation.
       * surf_changed reference: pristine relaxed slab (sid lookup) when
             ``load_pristine_context`` has been called by the caller; otherwise
             falls back to ``pos_gt[tags != 2]``.
@@ -85,6 +89,7 @@ def _passes_anomaly(
     from adsorbgen.eval import _score_record_anomaly
     record = {
         "sid": int(sid),
+        "ads_id": int(ads_id),
         "pos_ref": torch.as_tensor(pos_ref, dtype=torch.float32),
         "pos_pred": torch.as_tensor(pos_pred, dtype=torch.float32),
         "pos_gt": torch.as_tensor(pos_gt, dtype=torch.float32),
@@ -206,7 +211,11 @@ def run_replay_eval(
         gt_info = gt_index_by_sid.get(sid)
         if gt_info is None or not gt_info.get("eligible"):
             continue
-        E_gt = gt_info["E_sys_min"]
+        # Prefer the oc20 rebuilt mean reference when present. For a given
+        # unique system, E_slab and E_gas are constants, so comparing E_sys to
+        # the group's mean E_sys is equivalent to comparing E_ads to mean E_ads.
+        # Fall back to older min-based indexes for backward compatibility.
+        E_gt = gt_info.get("E_sys_mean", gt_info.get("E_sys_min"))
         if E_gt is None:
             continue
         system_key = gt_info["system_key"]
@@ -257,11 +266,19 @@ def run_replay_eval(
                 **extra,
             )
 
-        x_out = euler_sample(
+        # Capture the flow Euler trajectory when viz is enabled (deterministic
+        # ODE — exactly the inference path, just also kept for rendering).
+        _capture_flow = bool(cfg.viz_root)
+        _es = euler_sample(
             fwd, batch["pos"],
             batch["movable_mask"], batch["pad_mask"], flow_cfg,
             num_steps=cfg.flow_steps,
+            return_trajectory=_capture_flow,
         )
+        if _capture_flow:
+            x_out, flow_traj_b = _es["x_out"], _es["x_trajectory"]
+        else:
+            x_out, flow_traj_b = _es, None
 
         # Extract each sample's predictions (trim padding)
         for i, w in enumerate(chunk):
@@ -291,6 +308,10 @@ def run_replay_eval(
                 "cell": cell_i,
                 "atoms_init": atoms_init,
                 "pos_pred": pos_pred_i,
+                "flow_traj": (
+                    flow_traj_b[:, i, :n, :].detach().cpu().numpy().astype(np.float32)
+                    if flow_traj_b is not None else None
+                ),
                 "pos_relaxed": pos_relaxed_i,
             })
 
@@ -432,6 +453,7 @@ def run_replay_eval(
                     tags=p["tags"],
                     cell=p["cell"],
                     sid=p["sid"],
+                    ads_id=int(p["ads_id"]),
                 )
                 if not passed:
                     if reason == "dissociated":       n_dissoc += 1
@@ -521,6 +543,16 @@ def run_replay_eval(
                 p["numbers"], p["pos_pred"],
                 p["cell"], p["tags"], sys_dir / "x1_flow.pdb", offset=offset,
             )
+            ft = p.get("flow_traj")
+            if ft is not None:
+                save_trajectory_xyz(
+                    p["numbers"], ft, p["cell"], p["tags"],
+                    sys_dir / "flow_traj.xyz", offset=offset,
+                )
+                save_trajectory_pdb(
+                    p["numbers"], ft, p["cell"], p["tags"],
+                    sys_dir / "flow_traj.pdb", offset=offset,
+                )
             if r["converged"]:
                 save_structure_pdb(
                     p["numbers"], r["relaxed_pos"],

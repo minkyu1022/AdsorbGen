@@ -25,12 +25,16 @@ weighted by ``improvement`` by default.
 """
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 import pickle
 import random
+import time
 from bisect import insort
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -110,6 +114,9 @@ class ReplayBuffer:
 
     def n_systems(self) -> int:
         return len(self._by_system)
+
+    def iter_entries(self):
+        return iter(self._entries)
 
     def add(self, entry: ReplayEntry) -> bool:
         """Insert one entry, honoring per-system and global caps.
@@ -229,3 +236,186 @@ class ReplayBuffer:
             buf._entries.append(e)
             buf._by_system.setdefault(sk, []).append(idx)
         return buf
+
+
+# ---------------------------------------------------------------------------
+# Append-only replay stream (writer + reader)
+#
+# Contract: replay daemon processes write `ReplayEntry` records into a
+# directory tree, one subdir per shard. Training reads them incrementally,
+# tracking how many manifest lines it has already consumed per shard.
+#
+# Layout:
+#     {root}/
+#       shard_{shard_id}/
+#         chunk_00000.pkl    list[ReplayEntry]
+#         chunk_00001.pkl
+#         manifest.jsonl     one line per flushed chunk
+#
+# The manifest line is the single source of truth that a chunk has been
+# fully written and is safe to read. Chunk pkl files are produced via
+# atomic rename (write to .tmp, then os.replace).
+# ---------------------------------------------------------------------------
+
+
+def _atomic_pickle_write(path: Path, payload) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class ReplayStreamWriter:
+    """One writer per shard. Append-only with chunked flushes."""
+
+    def __init__(self, root: Path, shard_id: int, chunk_size: int = 64):
+        self.root = Path(root) / f"shard_{int(shard_id)}"
+        self.shard_id = int(shard_id)
+        self.chunk_size = int(chunk_size)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._buffer: List[ReplayEntry] = []
+        self._next_chunk_idx = self._find_next_chunk_idx()
+
+    def _find_next_chunk_idx(self) -> int:
+        existing = sorted(self.root.glob("chunk_*.pkl"))
+        if not existing:
+            return 0
+        try:
+            return int(existing[-1].stem.split("_")[1]) + 1
+        except (IndexError, ValueError):
+            return 0
+
+    def append(self, entry: ReplayEntry) -> None:
+        self._buffer.append(entry)
+        if len(self._buffer) >= self.chunk_size:
+            self.flush()
+
+    def extend(self, entries: Iterable[ReplayEntry]) -> None:
+        for e in entries:
+            self.append(e)
+
+    def flush(self) -> Optional[int]:
+        """Write current buffer as a new chunk. Returns chunk index or None."""
+        if not self._buffer:
+            return None
+        idx = self._next_chunk_idx
+        chunk_path = self.root / f"chunk_{idx:05d}.pkl"
+        payload = [e.to_dict() for e in self._buffer]
+        _atomic_pickle_write(chunk_path, payload)
+
+        manifest_path = self.root / "manifest.jsonl"
+        line = json.dumps({
+            "chunk": idx,
+            "n_entries": len(self._buffer),
+            "mtime": time.time(),
+            "shard_id": self.shard_id,
+        }) + "\n"
+        with open(manifest_path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                if end > 0:
+                    f.seek(end - 1)
+                    if f.read(1) != "\n":
+                        # Previous writer may have died mid-line. Separate the
+                        # corrupted record so this valid record remains readable.
+                        f.write("\n")
+                    f.seek(0, os.SEEK_END)
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        self._buffer.clear()
+        self._next_chunk_idx += 1
+        return idx
+
+
+class ReplayStreamReader:
+    """Incremental multi-shard reader.
+
+    Each call to ``load_new_chunks`` returns ReplayEntry instances from
+    manifest lines that were not seen on previous calls. Safe to call
+    repeatedly; idempotent within a process lifetime.
+    """
+
+    def __init__(self, root: Path, shard_ids: Optional[List[int]] = None):
+        self.root = Path(root)
+        self.shard_ids: List[int] = (
+            sorted(int(s) for s in shard_ids) if shard_ids is not None
+            else self._discover_shard_ids()
+        )
+        # Number of manifest lines already consumed per shard.
+        self._consumed: Dict[int, int] = {sid: 0 for sid in self.shard_ids}
+
+    def _discover_shard_ids(self) -> List[int]:
+        if not self.root.exists():
+            return []
+        ids: List[int] = []
+        for p in sorted(self.root.glob("shard_*")):
+            if p.is_dir():
+                try:
+                    ids.append(int(p.name.split("_")[1]))
+                except (IndexError, ValueError):
+                    continue
+        return sorted(ids)
+
+    def refresh_shards(self) -> None:
+        """Pick up newly-created shard directories (daemon may add later)."""
+        for sid in self._discover_shard_ids():
+            self._consumed.setdefault(sid, 0)
+        # keep ordering deterministic
+        self.shard_ids = sorted(self._consumed.keys())
+
+    def load_new_chunks(self) -> List[ReplayEntry]:
+        """Return ReplayEntry from manifest lines newer than last consumed."""
+        self.refresh_shards()
+        out: List[ReplayEntry] = []
+        for sid in self.shard_ids:
+            shard_root = self.root / f"shard_{sid}"
+            manifest = shard_root / "manifest.jsonl"
+            if not manifest.exists():
+                continue
+            with open(manifest, "r") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    lines = f.readlines()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            consumed = self._consumed.get(sid, 0)
+            for raw in lines[consumed:]:
+                if not raw.endswith("\n"):
+                    # line is still being written; pick up next call
+                    break
+                stripped = raw.strip()
+                if not stripped:
+                    consumed += 1
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    # newline-terminated but corrupted (e.g. writer crashed
+                    # mid-line then recovered): skip permanently and advance.
+                    consumed += 1
+                    continue
+                chunk_path = shard_root / f"chunk_{int(rec['chunk']):05d}.pkl"
+                if not chunk_path.exists():
+                    break
+                try:
+                    with open(chunk_path, "rb") as cf:
+                        payload = pickle.load(cf)
+                except (EOFError, pickle.UnpicklingError):
+                    # chunk pkl mid-write race; bail and retry next call
+                    break
+                for d in payload:
+                    out.append(ReplayEntry.from_dict(d))
+                consumed += 1
+            self._consumed[sid] = consumed
+        return out
+
+    def n_consumed(self) -> Dict[int, int]:
+        return dict(self._consumed)

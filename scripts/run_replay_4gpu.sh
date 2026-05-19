@@ -10,21 +10,22 @@
 #   bash scripts/run_replay_4gpu.sh
 set -euo pipefail
 
-REPO=/home/minkyu/Cat-bench
-PYTHON=/home/minkyu/micromamba/envs/adsorbRL/bin/python3
+CODE_REPO="${CODE_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+CAT_BENCH_ROOT="${CAT_BENCH_ROOT:-$(dirname "${CODE_REPO}")}"
+PYTHON="${PYTHON:-$(command -v python)}"
 
-RUN_DIR="${RUN_DIR:-${REPO}/runs/full_v0_ads_ref_x1_l1_allpairL1ref1_noreplay}"
+RUN_DIR="${RUN_DIR:-${CAT_BENCH_ROOT}/runs/full_v0_ads_ref_x1_l1_allpairL1ref1_noreplay}"
 CKPT="${CKPT:-${RUN_DIR}/ckpt_epochepoch=029.ckpt}"
-GT_INDEX="${GT_INDEX:-${REPO}/data/replay/gt_index_by_sid.pkl}"
-TRAIN_LMDB="${TRAIN_LMDB:-${REPO}/data/processed/is2res_train.lmdb}"
+GT_INDEX="${GT_INDEX:-${CAT_BENCH_ROOT}/data/replay/gt_index_by_sid.pkl}"
+TRAIN_LMDB="${TRAIN_LMDB:-${CAT_BENCH_ROOT}/data/processed/is2res_train.lmdb}"
 
 EPOCH_TAG="${EPOCH_TAG:-30}"
 NUM_SYSTEMS="${NUM_SYSTEMS:-500}"
 NUM_PLACEMENTS="${NUM_PLACEMENTS:-3}"
 UMA_MAX_STEPS="${UMA_MAX_STEPS:-100}"
-PRISTINE_SLABS="${PRISTINE_SLABS:-${REPO}/results/pristine_slabs/is2res.pkl}"
-PRISTINE_SID_INDEX="${PRISTINE_SID_INDEX:-${REPO}/results/pristine_slabs/is2res.sid_index.pkl}"
-GPUS=(${GPUS:-4 5 6 7})
+PRISTINE_SLABS="${PRISTINE_SLABS:-${CAT_BENCH_ROOT}/results/pristine_slabs/is2res.pkl}"
+PRISTINE_SID_INDEX="${PRISTINE_SID_INDEX:-${CAT_BENCH_ROOT}/results/pristine_slabs/is2res.sid_index.pkl}"
+GPUS=(${GPUS:-0 1 2 3})
 NUM_SHARDS="${#GPUS[@]}"
 
 SHARD_ROOT="${RUN_DIR}/replay_shards"
@@ -58,8 +59,8 @@ for i in "${!GPUS[@]}"; do
   echo "[launch] shard ${i} on GPU ${GPU} → ${LOG}"
   CUDA_VISIBLE_DEVICES="${GPU}" \
   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-  PYTHONPATH="${REPO}/AdsorbGen" \
-    "${PYTHON}" "${REPO}/scripts/replay_one_ckpt.py" \
+  PYTHONPATH="${CODE_REPO}:${PYTHONPATH:-}" \
+    "${PYTHON}" "${CODE_REPO}/scripts/replay_one_ckpt.py" \
       --ckpt "${CKPT}" \
       --gt-index "${GT_INDEX}" \
       --train-lmdb "${TRAIN_LMDB}" \
@@ -97,7 +98,8 @@ fi
 
 echo ""
 echo "[merge] consolidating shards → ${FINAL_VIZ_ROOT}/ep${EPOCH_TAG}"
-"${PYTHON}" "${REPO}/scripts/merge_replay_shards.py" \
+PYTHONPATH="${CODE_REPO}:${PYTHONPATH:-}" \
+"${PYTHON}" "${CODE_REPO}/scripts/merge_replay_shards.py" \
   --shard-root "${SHARD_ROOT}" \
   --final-viz-root "${FINAL_VIZ_ROOT}" \
   --final-buffer "${FINAL_BUFFER}" \
@@ -111,5 +113,5 @@ echo "  buffer:  ${FINAL_BUFFER}"
 echo "  metrics: ${FINAL_METRICS}"
 echo ""
 echo "Launch UI:"
-echo "  REPLAY_VIZ_ROOT=${FINAL_VIZ_ROOT} bash viz/run_viz.sh backend"
-echo "  bash viz/run_viz.sh frontend"
+echo "  REPLAY_VIZ_ROOT=${FINAL_VIZ_ROOT} bash ${CODE_REPO}/viz/run_viz.sh backend"
+echo "  bash ${CODE_REPO}/viz/run_viz.sh frontend"
