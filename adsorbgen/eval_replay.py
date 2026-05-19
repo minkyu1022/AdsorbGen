@@ -353,6 +353,9 @@ def run_replay_eval(
 
     # --- PHASE 2: batched UMA FIRE relaxation ---
     n_success = n_added = n_candidates_valid = 0
+    strict_success_systems: set = set()
+    relaxed_success_candidates = {0.1: 0, 0.2: 0, 0.3: 0}
+    relaxed_success_systems = {0.1: set(), 0.2: set(), 0.3: set()}
     n_dissoc = n_desorbed = n_surf_changed = n_intercalated = n_overlap = 0
     n_uma_unconverged = 0
 
@@ -464,8 +467,14 @@ def run_replay_eval(
                     status = reason
                 else:
                     n_candidates_valid += 1
+                    sys_key = tuple(p["system_key"])
+                    for tol in relaxed_success_candidates:
+                        if E_pred < p["E_gt"] + tol:
+                            relaxed_success_candidates[tol] += 1
+                            relaxed_success_systems[tol].add(sys_key)
                     if E_pred + cfg.success_margin < p["E_gt"]:
                         n_success += 1
+                        strict_success_systems.add(sys_key)
                         success = True
                         improvement = p["E_gt"] - E_pred
                         entry = ReplayEntry(
@@ -620,6 +629,13 @@ def run_replay_eval(
         "systems_evaluated": len(sys_indices),
         "candidates": total_candidates,
         "n_success": n_success,
+        "n_success_systems": len(strict_success_systems),
+        "n_relaxed_success_plus_0p1": relaxed_success_candidates[0.1],
+        "n_relaxed_success_plus_0p2": relaxed_success_candidates[0.2],
+        "n_relaxed_success_plus_0p3": relaxed_success_candidates[0.3],
+        "n_relaxed_success_systems_plus_0p1": len(relaxed_success_systems[0.1]),
+        "n_relaxed_success_systems_plus_0p2": len(relaxed_success_systems[0.2]),
+        "n_relaxed_success_systems_plus_0p3": len(relaxed_success_systems[0.3]),
         "n_added_to_buffer": n_added,
         "buffer_size": len(buffer),
         "buffer_n_systems": buffer.n_systems(),

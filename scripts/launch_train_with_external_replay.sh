@@ -22,6 +22,12 @@ CODE="${PYTHONPATH%%:*}"
 MICROMAMBA="${MICROMAMBA:-/home/irteam/.local/bin/micromamba}"
 MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/home/irteam/micromamba}"
 
+# Training x1 targets. Default: UMA-s-1p1/oc20 re-relaxed structures
+# (processed_mlip_oc20, built by build_mlip_relaxed_lmdbs.py) so the flow x1
+# target is on the same MLIP scale as replay. Override to ${ROOT}/data/processed
+# to train on the original DFT-relaxed targets instead.
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-${ROOT}/data/processed_mlip_oc20}"
+
 # --- required ---
 OUT="${OUT:?OUT is required (training run directory)}"
 STREAM_DIR="${STREAM_DIR:?STREAM_DIR is required (where replay daemon writes)}"
@@ -77,11 +83,11 @@ env \
 setsid ${MICROMAMBA} run -n adsorbgen python -m adsorbgen.train \
   --arch v1 \
   --train-lmdb \
-    "${ROOT}/data/processed/is2res_train.lmdb" \
-    "${ROOT}/data/processed/is2res_val.lmdb" \
-    "${ROOT}/data/processed/is2res_val_ood_ads.lmdb" \
-    "${ROOT}/data/processed/is2res_val_ood_cat.lmdb" \
-    "${ROOT}/data/processed/is2res_val_ood_both.lmdb" \
+    "${TRAIN_DATA_DIR}/is2res_train.lmdb" \
+    "${TRAIN_DATA_DIR}/is2res_val.lmdb" \
+    "${TRAIN_DATA_DIR}/is2res_val_ood_ads.lmdb" \
+    "${TRAIN_DATA_DIR}/is2res_val_ood_cat.lmdb" \
+    "${TRAIN_DATA_DIR}/is2res_val_ood_both.lmdb" \
   --val-lmdb "${ROOT}/data/processed/oc20dense.lmdb" \
   --batch-size "${BATCH_SIZE}" --num-workers "${NUM_WORKERS}" \
   --epochs "${EPOCHS}" --devices "${N_DEVICES}" \
