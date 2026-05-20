@@ -369,6 +369,10 @@ def run_replay_eval(
     relaxed_success_systems = {0.1: set(), 0.2: set(), 0.3: set()}
     n_dissoc = n_desorbed = n_surf_changed = n_intercalated = n_overlap = 0
     n_uma_unconverged = 0
+    # Optional: one dict per candidate (post-relax), regardless of success —
+    # lets a report script compute strict + relaxed (+0.1/+0.2/+0.3) tallies
+    # from the same single eval pass without re-running.
+    all_preds = [] if cfg.collect_predictions else None
 
     uma_chunks = _chunk_by_atom_budget(predictions, cfg.uma_atom_budget)
     uma_pbar = tqdm(
