@@ -128,6 +128,14 @@ class ReplayEvalConfig:
     # --- visualization capture ---
     viz_capture_n: int = 32            # systems to save viz artifacts for each cycle
     viz_root: str = ""                 # dir to store replay_viz/ep{N}/ (empty → disabled)
+    # --- one-off eval mode: custom E_gt source + dump every candidate ---
+    e_gt_key: str = ""                 # override gt_index key for E_gt
+                                        # (e.g. "E_sys_min"). Empty = default
+                                        # E_sys_mean → E_sys_min fallback.
+    collect_predictions: bool = False  # if True, metrics["predictions"] carries
+                                        # one dict per (sid, placement) candidate
+                                        # — for strict + relaxed reporting that
+                                        # needs near-misses, not just successes.
 
 
 def _chunk_by_atom_budget(items: List[dict], budget: int) -> List[List[dict]]:
@@ -211,11 +219,14 @@ def run_replay_eval(
         gt_info = gt_index_by_sid.get(sid)
         if gt_info is None or not gt_info.get("eligible"):
             continue
-        # Prefer the oc20 rebuilt mean reference when present. For a given
-        # unique system, E_slab and E_gas are constants, so comparing E_sys to
-        # the group's mean E_sys is equivalent to comparing E_ads to mean E_ads.
-        # Fall back to older min-based indexes for backward compatibility.
-        E_gt = gt_info.get("E_sys_mean", gt_info.get("E_sys_min"))
+        # E_gt source: explicit cfg.e_gt_key (e.g. "E_sys_min") when set, else
+        # default to the oc20 mean reference with E_sys_min fallback. For a
+        # given unique system E_slab/E_gas are constants, so E_sys ↔ E_ads
+        # comparisons are equivalent up to that constant.
+        if cfg.e_gt_key:
+            E_gt = gt_info.get(cfg.e_gt_key)
+        else:
+            E_gt = gt_info.get("E_sys_mean", gt_info.get("E_sys_min"))
         if E_gt is None:
             continue
         system_key = gt_info["system_key"]
@@ -503,6 +514,18 @@ def run_replay_eval(
                 "status": status,
                 "success": success,
             }
+            if all_preds is not None:
+                all_preds.append({
+                    "sid": int(p["sid"]),
+                    "ads_id": int(p["ads_id"]),
+                    "system_key": tuple(p["system_key"]),
+                    "E_pred": float(E_pred),
+                    "E_gt": float(p["E_gt"]),
+                    "improvement": float(p["E_gt"] - E_pred),
+                    "fmax": float(fmax_i),
+                    "converged": bool(converged),
+                    "status": str(status),
+                })
 
         # --- viz: stash trajectory + per-system result for winner-selection ---
         if traj_hook is not None:
@@ -648,6 +671,8 @@ def run_replay_eval(
         "overlap_rate": n_overlap / denom,
         "uma_unconverged_rate": n_uma_unconverged / denom,
     }
+    if all_preds is not None:
+        metrics["predictions"] = all_preds
     if logger is not None:
         logger(metrics)
     return metrics

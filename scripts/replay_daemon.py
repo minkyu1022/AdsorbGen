@@ -181,14 +181,27 @@ def build_unique_system_index(datasets, lmdb_paths, gt_index) -> list:
 
 
 def _aggregate_metrics(ms: list) -> dict:
-    """Merge per-LMDB run_replay_eval metrics into one cycle-level dict."""
+    """Merge per-LMDB run_replay_eval metrics into one cycle-level dict.
+
+    Strict/relaxed success counts sum across LMDBs because build_unique_system_index
+    assigns each unique system_key to exactly one LMDB slice — so per-LMDB
+    ``strict_success_systems`` / ``relaxed_success_systems`` sets are disjoint.
+    """
     tot_c = sum(m.get("candidates", 0) for m in ms)
     out = {
         "candidates": tot_c,
         "systems_evaluated": sum(m.get("systems_evaluated", 0) for m in ms),
         "n_success": sum(m.get("n_success", 0) for m in ms),
+        "n_success_systems": sum(m.get("n_success_systems", 0) for m in ms),
         "n_added_to_buffer": sum(m.get("n_added_to_buffer", 0) for m in ms),
     }
+    for k in ("n_relaxed_success_plus_0p1",
+              "n_relaxed_success_plus_0p2",
+              "n_relaxed_success_plus_0p3",
+              "n_relaxed_success_systems_plus_0p1",
+              "n_relaxed_success_systems_plus_0p2",
+              "n_relaxed_success_systems_plus_0p3"):
+        out[k] = sum(m.get(k, 0) for m in ms)
     for rk in ("valid_rate", "dissoc_rate", "desorbed_rate", "surf_changed_rate",
                "intercalated_rate", "overlap_rate", "uma_unconverged_rate"):
         out[rk] = (sum(m.get(rk, 0.0) * m.get("candidates", 0) for m in ms)
@@ -313,6 +326,12 @@ def main():
                         "0 = no schedule (default).")
     p.add_argument("--overlap-threshold", type=float, default=0.5)
     p.add_argument("--viz-capture-n", type=int, default=0)
+    p.add_argument("--e-gt-key", default="",
+                   help='override gt_index key for E_gt (e.g. "E_sys_min"); '
+                        'empty = default E_sys_mean→E_sys_min fallback')
+    p.add_argument("--collect-predictions", action="store_true",
+                   help="dump every per-candidate prediction to a pkl per "
+                        "cycle (for strict + relaxed reporting); off by default")
 
     p.add_argument("--pristine-slabs", type=str, default="")
     p.add_argument("--pristine-index", "--pristine-sid-index",
@@ -442,6 +461,8 @@ def main():
             uma_atom_budget=args.uma_atom_budget,
             viz_capture_n=args.viz_capture_n,
             viz_root="",
+            e_gt_key=args.e_gt_key,
+            collect_predictions=args.collect_predictions,
         )
 
         cycle_buffer = ReplayBuffer(mode="append", per_system_cap=1_000_000,
@@ -515,6 +536,16 @@ def main():
 
         per_cycle = log_root / f"cycle_{cycle:06d}_shard{args.shard_idx}.json"
         per_cycle.write_text(json.dumps(cycle_metrics, indent=2))
+
+        if args.collect_predictions:
+            all_preds = []
+            for m in per_lmdb:
+                all_preds.extend(m.get("predictions", []))
+            pred_path = log_root / f"cycle_{cycle:06d}_shard{args.shard_idx}_predictions.pkl"
+            with open(pred_path, "wb") as f:
+                pickle.dump(all_preds, f)
+            print(f"[daemon] cycle {cycle}: wrote {len(all_preds)} predictions "
+                  f"to {pred_path.name}", flush=True)
 
         # one-line summary
         with open(summary_path, "a") as f:
