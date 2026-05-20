@@ -24,7 +24,7 @@ done
 
 echo "[finalize_refs] reconverge finished $(date -Is); rebuilding merged E_sys/GT indexes"
 "$PYTHON_BIN" scripts/merge_e_sys_and_rebuild_gt.py \
-  --shards-dir "$SHARDS_DIR" \
+  --shard-dir "$SHARDS_DIR" \
   --out-dir "$OUT_DIR" \
   --old-gt-index "$OUT_DIR/gt_index_by_sid.pkl"
 
