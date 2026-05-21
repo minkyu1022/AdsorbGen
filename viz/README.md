@@ -210,7 +210,7 @@ Backend(:8000)와 Frontend(:3000) 둘 다 떠있어야 한다. Frontend
 
 ## 참고
 
-- 데이터 캡처는 `adsorbgen/replay_viz.py`의 `TrajectoryHook`이 담당
+- 데이터 캡처는 `adsorbgen/replay/viz.py`의 `TrajectoryHook`이 담당
   (nvalchemi.dynamics FIRE에 attach). 매 step에서 positions / energy / fmax
   기록.
 - Backend 핫 리로드 ON: `viz/backend/main.py` 수정 시 자동 재시작.

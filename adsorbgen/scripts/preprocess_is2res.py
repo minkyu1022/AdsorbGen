@@ -4,7 +4,7 @@ The raw OC20 LMDB contains pickled legacy `torch_geometric.data.Data` objects
 which break under modern torch_geometric. We read them once via `__dict__`,
 extract the fields we need, center the movable atoms' centroid at the origin,
 and write a clean numpy-only LMDB consumable by
-`adsorbgen.dataset.PreprocessedDisplacementDataset` with `unconditional=True`.
+`adsorbgen.data.dataset.PreprocessedDisplacementDataset` with `unconditional=True`.
 
 Usage:
     PYTHONPATH=AdsorbGen python -m adsorbgen.scripts.preprocess_is2res \

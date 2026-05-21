@@ -25,7 +25,7 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from adsorbgen.multiplace import DEFAULT_ADSORBATES_PKL, MultiPlacementDataset  # noqa: E402
+from adsorbgen.data.multiplace import DEFAULT_ADSORBATES_PKL, MultiPlacementDataset  # noqa: E402
 
 
 def _write_slab_lmdb(path: str, n: int, ads_id: int = 1):

@@ -1,4 +1,4 @@
-"""Unit tests for adsorbgen.energy.UMAEnergy.
+"""Unit tests for adsorbgen.evaluation.energy.UMAEnergy.
 
 Loads fairchem's UMA-s-1p1 predictor with task='oc20' and runs a small
 padded batch through the energy head. The test is skipped when fairchem
@@ -21,7 +21,7 @@ if _REPO not in sys.path:
 
 def _try_load_uma():
     try:
-        from adsorbgen.energy import UMAEnergy
+        from adsorbgen.evaluation.energy import UMAEnergy
         return UMAEnergy(model_name="uma-s-1p1", device="cpu", task_name="oc20")
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"UMA-s-1p1 unavailable (offline or download failed): {e}")
@@ -67,7 +67,7 @@ def test_uma_energy_per_atom_normalization():
 
 
 def test_make_fk_energy_fn_binds_context():
-    from adsorbgen.energy import make_fk_energy_fn
+    from adsorbgen.evaluation.energy import make_fk_energy_fn
 
     class _Fake(torch.nn.Module):
         def forward(self, x, cell, nums, pad):

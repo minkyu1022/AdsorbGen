@@ -1,4 +1,4 @@
-"""Unit tests for adsorbgen.eval primitives.
+"""Unit tests for adsorbgen.evaluation.metrics primitives.
 
 Covers the displacement-error aggregator on a handful of hand-built records.
 Strict validity (compute_anomaly_metrics) requires ase + fairchem and is
@@ -17,7 +17,7 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from adsorbgen.eval import compute_displacement_metrics  # noqa: E402
+from adsorbgen.evaluation.metrics import compute_displacement_metrics  # noqa: E402
 
 
 def test_compute_displacement_metrics_zero_error_is_perfect():

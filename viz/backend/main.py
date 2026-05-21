@@ -1,7 +1,7 @@
 """Replay viz backend (FastAPI).
 
 Serves structures + trajectories + per-step data captured by
-``adsorbgen.replay_viz`` during training replay eval.
+``adsorbgen.replay.viz`` during training replay eval.
 
 Run:
     uvicorn viz.backend.main:app --host 0.0.0.0 --port 8000 --reload

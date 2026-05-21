@@ -20,8 +20,8 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from adsorbgen.model_factory import build_model  # noqa: E402
-from adsorbgen.model_v2 import DiTDenoiserV2, DiTDenoiserV2Config  # noqa: E402
+from adsorbgen.models.factory import build_model  # noqa: E402
+from adsorbgen.models.dit_v2 import DiTDenoiserV2, DiTDenoiserV2Config  # noqa: E402
 
 
 def _tiny_cfg() -> DiTDenoiserV2Config:
