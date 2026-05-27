@@ -27,7 +27,7 @@ from ase.constraints import FixAtoms
 from ase.optimize import LBFGS
 from tqdm.auto import tqdm
 
-_REPO = Path(__file__).resolve().parents[1]
+_REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 

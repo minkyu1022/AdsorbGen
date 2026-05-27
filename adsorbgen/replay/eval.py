@@ -136,7 +136,7 @@ class ReplayEvalConfig:
                                         # one dict per (sid, placement) candidate
                                         # — for strict + relaxed reporting that
                                         # needs near-misses, not just successes.
-    use_sde: bool = False               # sample with stochastic SDE update
+    use_sde: bool = False               # sample with AtomMOF-style SDE update
     refine_final: bool = False          # extra final model call at t=1-eps
 
 

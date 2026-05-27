@@ -19,6 +19,7 @@ MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-/home/irteam/micromamba}"
 TRAIN_RUN_DIR="${TRAIN_RUN_DIR:-${ROOT}/runs/H200_ads_pair_dist_loss}"
 STREAM_DIR="${STREAM_DIR:-${ROOT}/runs/replay_5000x10_oneshot}"
 GT_INDEX="${GT_INDEX:-${ROOT}/data/replay/gt_index_by_sid_oc20.pkl}"
+LMDB_DIR="${LMDB_DIR:-${ROOT}/data/processed}"
 PRIOR_MODE="${PRIOR_MODE:-random_heuristic}"
 PRISTINE_PKL="${PRISTINE_PKL:-${ROOT}/results/pristine_slabs/is2res.pkl}"
 PRISTINE_IDX="${PRISTINE_IDX:-${ROOT}/results/pristine_slabs/is2res.sid_index.pkl}"
@@ -33,16 +34,17 @@ FLOW_BATCH_SIZE=${FLOW_BATCH_SIZE:-32}
 UMA_MAX_STEPS=${UMA_MAX_STEPS:-300}
 UMA_ATOM_BUDGET=${UMA_ATOM_BUDGET:-4000}
 UMA_FMAX=${UMA_FMAX:-0.05}
+UMA_MODEL="${UMA_MODEL:-uma-s-1p1}"
 USE_SDE="${USE_SDE:-0}"
 REFINE_FINAL="${REFINE_FINAL:-0}"
 SYSTEM_SEED="${SYSTEM_SEED:--1}"
 
 LMDBS=(
-  "${ROOT}/data/processed/is2res_train.lmdb"
-  "${ROOT}/data/processed/is2res_val.lmdb"
-  "${ROOT}/data/processed/is2res_val_ood_ads.lmdb"
-  "${ROOT}/data/processed/is2res_val_ood_cat.lmdb"
-  "${ROOT}/data/processed/is2res_val_ood_both.lmdb"
+  "${LMDB_DIR}/is2res_train.lmdb"
+  "${LMDB_DIR}/is2res_val.lmdb"
+  "${LMDB_DIR}/is2res_val_ood_ads.lmdb"
+  "${LMDB_DIR}/is2res_val_ood_cat.lmdb"
+  "${LMDB_DIR}/is2res_val_ood_both.lmdb"
 )
 
 mkdir -p "${STREAM_DIR}/logs"
@@ -92,7 +94,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
         --flow-steps "${FLOW_STEPS}" \
         --flow-batch-size "${FLOW_BATCH_SIZE}" \
         --prior-mode "${PRIOR_MODE}" \
-        --uma-model uma-s-1p1 \
+        --uma-model "${UMA_MODEL}" \
         --uma-fmax "${UMA_FMAX}" \
         --uma-max-steps "${UMA_MAX_STEPS}" \
         --uma-atom-budget "${UMA_ATOM_BUDGET}" \

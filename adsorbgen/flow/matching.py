@@ -313,8 +313,22 @@ def euler_sample(
     refine_final: bool = False,
     return_trajectory: bool = False,
     fk_steering: Optional[FKSteeringConfig] = None,
+    sde_schedule: str = "atommof",
+    sde_alpha: float = 1.0,
+    sde_no_score: bool = False,
 ):
     """Euler integrator on absolute coordinates (AtomMOF-style).
+
+    When use_sde=True, applies the AtomMOF SDE update at every step:
+        g^2(t) per ``sde_schedule``:
+            "atommof"   -> 0.5 * (1 - t)               [paper default, α ignored]
+            "zero_ends" -> sde_alpha * t * (1 - t)     [zero at both endpoints]
+        score  = (t * v_centered - x_t_centered) / (1 - t)
+        drift  = v + 0.5 * g^2 * score
+        x_t   += drift * dt + sqrt(g^2 * dt) * noise_centered
+    where centering subtracts the COM over movable atoms (preserving the
+    all-atom COM=0 invariant the model was trained on, given non-movable
+    atoms are frozen at pos_0).
 
     Args:
         model_forward: callable (x_t, t) -> pred_x_1. The caller closes over the
@@ -324,7 +338,7 @@ def euler_sample(
         pad_mask: (B, N) bool.
         cfg: FlowConfig (eps).
         num_steps: number of Euler steps.
-        use_sde: add SDE noise term with g^2(t) = 0.5*(1-t).
+        use_sde: enable AtomMOF-style SDE step.
         refine_final: one extra forward at t=1-eps used as final x_1 prediction.
         return_trajectory: return stacked x_t trajectory dict.
         fk_steering: optional particle steering config.
@@ -353,6 +367,44 @@ def euler_sample(
             raise ValueError(
                 f"Batch size {B} must be divisible by num_particles {fk_steering.num_particles}"
             )
+
+    # AtomMOF SDE knobs:
+    #   schedule:    g²(t) = 0.5 · (1 - t)
+    #   score:       s = (t · v_centered - x_t_centered) / (1 - t)
+    #                where centering subtracts the COM over movable atoms
+    #   noise:       zero-mean Gaussian on movable atoms (sum-to-zero)
+    # This preserves the all-atom COM=0 invariant the model trained on
+    # (non-movable atoms are frozen at pos_0; centering movable atoms keeps
+    # ads COM stable, matching the model's ads_center_rel head assumptions).
+    def _sde_step(x: torch.Tensor, v_in: torch.Tensor, t_s: float,
+                  dt_s: float) -> torch.Tensor:
+        n_movable = movable_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        # Centering of v, x over movable atoms (AtomMOF's score formula).
+        x_com = (x * movable_f).sum(dim=1, keepdim=True) / n_movable
+        v_com = (v_in * movable_f).sum(dim=1, keepdim=True) / n_movable
+        x_cen = (x - x_com) * movable_f
+        v_cen = (v_in - v_com) * movable_f
+
+        # g²(t)
+        if sde_schedule == "zero_ends":
+            g2 = sde_alpha * t_s * (1.0 - t_s)
+        else:  # "atommof"
+            g2 = 0.5 * (1.0 - t_s)
+        if sde_no_score:
+            # OMatG-RL surrogate SDE: drift = v only (no score correction).
+            score = torch.zeros_like(x_cen)
+        else:
+            score = (t_s * v_cen - x_cen) / max(1.0 - t_s, cfg.eps)
+            score = score * movable_f
+
+        # Zero-mean noise on movable atoms (preserves COM).
+        noise = torch.randn(x.shape, device=device, dtype=dtype) * movable_f
+        noise_com = noise.sum(dim=1, keepdim=True) / n_movable
+        noise = (noise - noise_com * movable_f) * movable_f
+
+        drift = v_in + 0.5 * g2 * score
+        return x + drift * dt_s + (g2 * dt_s) ** 0.5 * noise
 
     for i in range(num_steps):
         t_scalar = float(t_vals[i].item())
@@ -396,11 +448,7 @@ def euler_sample(
         v = v * movable_f
 
         if use_sde:
-            g2 = 0.5 * (1.0 - t_scalar)
-            score = _score_from_velocity(v, x_t, pos_0, t_scalar, cfg.eps) * movable_f
-            drift = v + 0.5 * g2 * score
-            noise = torch.randn_like(x_t) * movable_f
-            x_t = x_t + drift * dt + (g2 * dt) ** 0.5 * noise
+            x_t = _sde_step(x_t, v, t_scalar, dt)
         else:
             x_t = x_t + v * dt
 

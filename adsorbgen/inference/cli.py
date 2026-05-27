@@ -187,11 +187,28 @@ def main():
                    help="override path to args.json (default: ckpt_dir/args.json)")
     args = p.parse_args()
 
+    # Fix B: FK steering requires SDE for particles to diverge (otherwise all
+    # P copies stay identical and resampling is a no-op). AtomMOF auto-forces
+    # SDE; we mirror that here with a warning.
+    if args.fk_particles > 0 and not args.use_sde:
+        print("[fk] WARNING: --fk-particles>0 but --use-sde not set. "
+              "All FK particles would remain identical under deterministic ODE; "
+              "auto-enabling --use-sde (set sde_schedule/alpha via CLI if needed).",
+              flush=True)
+        args.use_sde = True
+
     torch.manual_seed(args.seed)
 
     torch.serialization.add_safe_globals(
         [DiTDenoiserConfig, DiTDenoiserV2Config, FlowConfig]
     )
+    # Legacy module path alias for ckpts saved before the adsorbgen.model →
+    # adsorbgen.models rename (e.g., H200_catflow_center_rel).
+    import adsorbgen.models.dit as _dit_mod
+    import adsorbgen.models.dit_v2 as _dit_v2_mod
+    sys.modules.setdefault("adsorbgen.model", _dit_mod)
+    sys.modules.setdefault("adsorbgen.model.dit", _dit_mod)
+    sys.modules.setdefault("adsorbgen.model.dit_v2", _dit_v2_mod)
 
     ckpt_path = Path(args.ckpt)
     assert ckpt_path.exists(), f"missing ckpt {ckpt_path}"
@@ -368,20 +385,43 @@ def main():
             x_out = sample_out
             x_traj = None
 
-        # Collapse FK groups by keeping particle 0 (FK reorders within a group,
-        # so any particle is fine — downstream eval can re-rank if desired).
+        # FK collapse:
+        #   AtomMOF picks the argmin-energy particle per (sample, placement)
+        #   after sampling. AdsorbGen used to keep particle 0; that wastes the
+        #   FK pool. When FK is active and energy_model is available, evaluate
+        #   x_out across all P particles and select argmin per (BK,) group.
+        if P > 1 and args.fk_particles > 0 and energy_model is not None:
+            with torch.no_grad():
+                e_final = energy_model(
+                    x_out,
+                    work["cell"],
+                    work["atomic_numbers"],
+                    work["pad_mask"],
+                )  # (BK*P,)
+            e_final = e_final.view(BK, P)
+            best_p = torch.argmin(e_final, dim=1)            # (BK,)
+            row_idx = torch.arange(BK, device=x_out.device) * P + best_p
+            best_idx_full = row_idx
+            print(f"[fk] argmin particle picked (mean E={e_final.gather(1, best_p[:,None]).mean().item():.4f})", flush=True)
+        else:
+            best_idx_full = None
+
         def _pick(t: torch.Tensor) -> torch.Tensor:
             if P == 1:
                 return t
+            if best_idx_full is not None:
+                return t.index_select(0, best_idx_full.to(t.device))
             return t.view(BK, P, *t.shape[1:])[:, 0]
 
         x_final = _pick(x_out)          # (BK, N, 3)
         traj_g = None
         if x_traj is not None:
-            # (T, BK*P, N, 3) -> keep particle 0 if FK is active, then group by
+            # (T, BK*P, N, 3) -> keep best particle if FK is active, then group by
             # base system and placement.
             if P == 1:
                 traj_pick = x_traj
+            elif best_idx_full is not None:
+                traj_pick = x_traj.index_select(1, best_idx_full.to(x_traj.device))
             else:
                 traj_pick = x_traj.view(x_traj.shape[0], BK, P, *x_traj.shape[2:])[:, :, 0]
             traj_g = traj_pick.view(traj_pick.shape[0], B_orig, K, *traj_pick.shape[2:])

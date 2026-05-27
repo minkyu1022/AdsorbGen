@@ -250,6 +250,12 @@ def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
     torch.serialization.add_safe_globals(
         [DiTDenoiserConfig, DiTDenoiserV2Config, FlowConfig]
     )
+    import sys
+    import adsorbgen.models.dit as _dit_mod
+    import adsorbgen.models.dit_v2 as _dit_v2_mod
+    sys.modules.setdefault("adsorbgen.model", _dit_mod)
+    sys.modules.setdefault("adsorbgen.model.dit", _dit_mod)
+    sys.modules.setdefault("adsorbgen.model.dit_v2", _dit_v2_mod)
     ck = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     hp = ck["hyper_parameters"]
     model = build_model(hp["model_cfg"])
@@ -335,7 +341,7 @@ def main():
                    help="dump every per-candidate prediction to a pkl per "
                         "cycle (for strict + relaxed reporting); off by default")
     p.add_argument("--use-sde", action="store_true",
-                   help="use stochastic SDE sampling instead of deterministic ODE Euler sampling")
+                   help="use AtomMOF-style SDE sampling instead of deterministic ODE")
     p.add_argument("--refine-final", action="store_true",
                    help="after sampling, make one extra model call at t=1-eps and use it as x1")
 

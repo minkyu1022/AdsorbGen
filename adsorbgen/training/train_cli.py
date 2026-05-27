@@ -93,6 +93,9 @@ class AdsorbGenModule(L.LightningModule):
         ads_center_loss_weight: float = 1.0,
         ads_rel_pos_loss_weight: float = 1.0,
         movable_mode: str = "surface_ads",
+        # --- stochastic interpolant noise (SiT-style finetuning) ---
+        gamma_schedule: str = "none",       # "none", "sqrt_t1mt", "linear_1mt"
+        gamma_sigma: float = 0.0,           # noise scale; 0 disables
         # --- replay params ---
         use_replay: bool = False,
         replay_buffer_path: str = "",      # runs/<out>/replay_buffer.pkl
@@ -556,6 +559,7 @@ class AdsorbGenModule(L.LightningModule):
 
         t = sample_t(pos.shape[0], self.flow_cfg, device=pos.device, dtype=pos.dtype)
         x_t = interpolate_xt(pos, pos_rel, t, movable)
+
         use_center_rel = bool(getattr(self._model_cfg(), "use_ads_center_rel_head", False))
         ads_center_1 = ads_rel_pos_1 = None
         if use_center_rel:
@@ -570,6 +574,39 @@ class AdsorbGenModule(L.LightningModule):
             ads_rel_pos_t = (1.0 - t_rel) * ads_rel_pos_0 + t_rel * ads_rel_pos_1
             ads_f = ads_mask.unsqueeze(-1).to(pos.dtype)
             x_t = x_t * (1.0 - ads_f) + (ads_center_t[:, None, :] + ads_rel_pos_t) * ads_f
+
+        # SiT-style stochastic interpolant noise on the FINAL x_t (after the
+        # center+rel block which overwrites ads atoms). For use_center_rel we
+        # also noise ads_center_t / ads_rel_pos_t consistently (same noise
+        # decomposition) so the model sees self-consistent inputs.
+        gamma_sigma = float(self.hparams.get("gamma_sigma", 0.0))
+        gamma_schedule = str(self.hparams.get("gamma_schedule", "none"))
+        if gamma_sigma > 0.0 and gamma_schedule != "none":
+            if gamma_schedule == "sqrt_t1mt":
+                gamma_t = gamma_sigma * torch.sqrt(t * (1.0 - t))
+            elif gamma_schedule == "linear_1mt":
+                gamma_t = gamma_sigma * (1.0 - t)
+            else:
+                raise ValueError(f"Unknown gamma_schedule={gamma_schedule!r}")
+            gt = gamma_t[:, None, None].to(x_t.dtype)
+            mov_f = movable.unsqueeze(-1).to(x_t.dtype)
+            z = torch.randn_like(x_t) * mov_f
+            if use_center_rel:
+                # Split noise on ads atoms into (com-mean, sum-to-zero rel).
+                n_ads = ads_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+                z_ads = z * ads_f
+                z_ads_com = z_ads.sum(dim=1, keepdim=True) / n_ads        # (B,1,3)
+                z_ads_rel = (z_ads - z_ads_com * ads_f) * ads_f
+                # Update center and rel separately (consistent with each other).
+                ads_center_t = ads_center_t + gamma_t[:, None].to(x_t.dtype) * z_ads_com.squeeze(1)
+                ads_rel_pos_t = ads_rel_pos_t + gt * z_ads_rel
+                # Reconstruct ads contribution to x_t from noised components.
+                ads_x_t = ads_center_t[:, None, :] + ads_rel_pos_t
+                # Non-ads movable atoms (surface): use original noise.
+                non_ads_mov_f = mov_f - ads_f
+                x_t = (x_t + gt * z * non_ads_mov_f) * (1.0 - ads_f) + ads_x_t * ads_f
+            else:
+                x_t = x_t + gt * z
 
         model_kwargs = dict(
             pos=pos, x_t=x_t, t=t,
@@ -1148,6 +1185,17 @@ def main():
                    help="x1: model predicts x_1 (default). v: model predicts "
                         "v = x_1 - x_0 (constant velocity field under linear flow).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--gamma-schedule",
+                   choices=["none", "sqrt_t1mt", "linear_1mt"],
+                   default="none",
+                   help="SiT-style stochastic interpolant noise schedule γ(t). "
+                        "sqrt_t1mt = σ·√(t(1-t)) (recommended, zero at both ends).")
+    p.add_argument("--gamma-sigma", type=float, default=0.0,
+                   help="Noise scale σ. 0 disables (pure deterministic interpolant).")
+    p.add_argument("--init-from-ckpt", type=str, default="",
+                   help="Load model weights from this ckpt (fresh optimizer/epoch). "
+                        "Use for finetuning without auto-resuming epoch counter or "
+                        "optimizer state. Overrides nothing else.")
 
     # Sample eval
     p.add_argument("--sample-eval-every-epochs", type=int, default=0)
@@ -1367,6 +1415,8 @@ def main():
         ads_center_loss_weight=args.ads_center_loss_weight,
         ads_rel_pos_loss_weight=args.ads_rel_pos_loss_weight,
         movable_mode=args.movable_mode,
+        gamma_schedule=args.gamma_schedule,
+        gamma_sigma=args.gamma_sigma,
         use_replay=args.use_replay,
         replay_buffer_path=replay_buffer_path,
         replay_gt_index_path=args.replay_gt_index if args.use_replay else "",
@@ -1479,6 +1529,31 @@ def main():
         print(f"[validate-only] loading {last_ckpt}", flush=True)
         trainer.validate(module, datamodule=dm, ckpt_path=str(last_ckpt))
         return
+
+    # Optional: load model weights from external ckpt (e.g. finetuning from a
+    # pretrained model with fresh optimizer/epoch counter). Skipped when the
+    # out_dir already has a last.ckpt (auto-resume takes priority).
+    if (not resume_ckpt) and getattr(args, "init_from_ckpt", ""):
+        init_path = Path(args.init_from_ckpt)
+        if not init_path.exists():
+            raise FileNotFoundError(f"--init-from-ckpt path not found: {init_path}")
+        # Module alias for legacy ckpts saved with the old module layout.
+        import sys as _sys
+        import adsorbgen.models.dit as _dit_mod
+        import adsorbgen.models.dit_v2 as _dit_v2_mod
+        _sys.modules.setdefault("adsorbgen.model", _dit_mod)
+        _sys.modules.setdefault("adsorbgen.model.dit", _dit_mod)
+        _sys.modules.setdefault("adsorbgen.model.dit_v2", _dit_v2_mod)
+        ck = torch.load(str(init_path), map_location="cpu", weights_only=False)
+        sd = ck.get("state_dict", ck)
+        missing, unexpected = module.load_state_dict(sd, strict=False)
+        print(f"[init-from-ckpt] {init_path}  missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+        # Free the loaded ckpt: it contains the full state (model, optimizer,
+        # lr_schedulers, hyper_parameters, loops, callbacks) which can be
+        # several GB. Release CPU memory before Lightning starts allocating.
+        del ck, sd
+        import gc as _gc
+        _gc.collect()
 
     trainer.fit(module, datamodule=dm, ckpt_path=resume_ckpt)
 
