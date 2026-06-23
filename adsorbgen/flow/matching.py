@@ -53,6 +53,60 @@ class FlowConfig:
     prediction_type: str = "x1"  # "x1" -> model predicts x_1; "v" -> model predicts v = x_1 - x_0
 
 
+def si_gamma(
+    t: torch.Tensor,
+    schedule: str,
+    sigma: float,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Latent SI noise scale gamma(t).
+
+    Mirrors OMatG's ``LatentGammaSqrt`` for ``sqrt_t1mt`` and keeps the
+    earlier AdsorbGen ``linear_1mt`` schedule for ablations.
+    """
+    if schedule == "sqrt_t1mt":
+        tt = (t * (1.0 - t)).clamp_min(float(eps))
+        return float(sigma) * torch.sqrt(tt)
+    if schedule == "linear_1mt":
+        return float(sigma) * (1.0 - t)
+    if schedule == "none" or float(sigma) == 0.0:
+        return torch.zeros_like(t)
+    raise ValueError(f"Unknown gamma_schedule={schedule!r}")
+
+
+def si_gamma_dot(
+    t: torch.Tensor,
+    schedule: str,
+    sigma: float,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Time derivative of gamma(t), used in the OMatG SI velocity target."""
+    if schedule == "sqrt_t1mt":
+        tt = (t * (1.0 - t)).clamp_min(float(eps))
+        return float(sigma) * (1.0 - 2.0 * t) / (2.0 * torch.sqrt(tt))
+    if schedule == "linear_1mt":
+        return torch.full_like(t, -float(sigma))
+    if schedule == "none" or float(sigma) == 0.0:
+        return torch.zeros_like(t)
+    raise ValueError(f"Unknown gamma_schedule={schedule!r}")
+
+
+def si_epsilon(
+    t: torch.Tensor,
+    schedule: str,
+    scale: float,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """SDE epsilon(t) used by OMatG's drift b - epsilon/gamma * eta."""
+    if schedule == "constant":
+        return torch.full_like(t, float(scale))
+    if schedule == "vanishing_1mt":
+        return float(scale) * (1.0 - t).clamp_min(float(eps))
+    if schedule == "zero":
+        return torch.zeros_like(t)
+    raise ValueError(f"Unknown si_epsilon_schedule={schedule!r}")
+
+
 def _target_for_loss(prediction_type: str, pos_0: torch.Tensor,
                      pos_1: torch.Tensor) -> torch.Tensor:
     """Loss target: x_1 (default) or velocity v = x_1 - x_0 on every atom.
@@ -80,11 +134,40 @@ def flow_loss_split(
     return x1_loss_split(pred, target, movable_mask, tags, loss_type=loss_type)
 
 
+def si_denoiser_loss(
+    pred_eta: torch.Tensor,
+    z: torch.Tensor,
+    atom_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Masked OMatG-style denoiser loss, with the constant restored as MSE.
+
+    OMatG ``SingleStochasticInterpolant._sde_loss`` uses
+    ``E[eta^2 - 2 eta z]`` for ``loss_z``. Adding the dropped ``E[z^2]``
+    constant makes the logged value non-negative without changing gradients.
+    """
+    _assert_finite(pred_eta, "pred_eta")
+    _assert_finite(z, "si_noise_z")
+    per_atom = (pred_eta - z).pow(2).sum(dim=-1)
+    mask = atom_mask.to(per_atom.dtype)
+    denom = mask.sum(dim=1).clamp_min(1.0)
+    return ((per_atom * mask).sum(dim=1) / denom).mean()
+
+
 def sample_t(
     batch_size: int, cfg: FlowConfig, device: torch.device,
     dtype: torch.dtype = torch.float32,
+    sampling: str = "uniform",
+    beta_alpha: float = 2.0,
+    beta_beta: float = 1.0,
 ) -> torch.Tensor:
-    u = torch.rand(batch_size, device=device, dtype=dtype)
+    if sampling == "uniform":
+        u = torch.rand(batch_size, device=device, dtype=dtype)
+    elif sampling == "beta":
+        alpha = torch.tensor(float(beta_alpha), device=device, dtype=dtype)
+        beta = torch.tensor(float(beta_beta), device=device, dtype=dtype)
+        u = torch.distributions.Beta(alpha, beta).sample((batch_size,))
+    else:
+        raise ValueError(f"Unknown t sampling={sampling!r}")
     return cfg.eps + (1 - 2 * cfg.eps) * u
 
 
@@ -259,6 +342,33 @@ def adsorbate_pair_distance_losses(
     }
 
 
+def selected_pair_distance_l1_loss(
+    pred_coords: torch.Tensor,
+    ref_coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+) -> torch.Tensor:
+    """All-pair distance L1 loss over a selected atom subset."""
+    _assert_finite(pred_coords, "pred_coords")
+    _assert_finite(ref_coords, "ref_coords")
+    pred_d = torch.cdist(pred_coords, pred_coords)
+    ref_d = torch.cdist(ref_coords, ref_coords)
+
+    B, N = atom_mask.shape
+    device = pred_coords.device
+    dtype = pred_coords.dtype
+    pair = atom_mask.unsqueeze(1) & atom_mask.unsqueeze(2)
+    upper = torch.triu(torch.ones(N, N, device=device, dtype=torch.bool), diagonal=1)
+    pair = pair & upper.unsqueeze(0)
+
+    m = pair.to(dtype)
+    denom = m.sum(dim=(1, 2))
+    has_any = denom > 0
+    per_sample = ((pred_d - ref_d).abs() * m).sum(dim=(1, 2)) / denom.clamp_min(1.0)
+    if has_any.any():
+        return per_sample[has_any].mean()
+    return torch.tensor(0.0, device=device, dtype=dtype)
+
+
 def _score_from_velocity(
     v: torch.Tensor,
     x_t: torch.Tensor,
@@ -316,6 +426,14 @@ def euler_sample(
     sde_schedule: str = "atommof",
     sde_alpha: float = 1.0,
     sde_no_score: bool = False,
+    sde_mode: str = "atommof",
+    si_gamma_schedule: str = "sqrt_t1mt",
+    si_gamma_sigma: float = 0.0,
+    si_epsilon_schedule: str = "vanishing_1mt",
+    si_epsilon_scale: float = 1.0,
+    time_schedule: str = "uniform",
+    time_schedule_beta: float = 2.0,
+    solver: str = "euler",
 ):
     """Euler integrator on absolute coordinates (AtomMOF-style).
 
@@ -338,7 +456,9 @@ def euler_sample(
         pad_mask: (B, N) bool.
         cfg: FlowConfig (eps).
         num_steps: number of Euler steps.
-        use_sde: enable AtomMOF-style SDE step.
+        use_sde: enable SDE step. ``sde_mode='atommof'`` keeps the legacy
+            AtomMOF score heuristic; ``sde_mode='omatg_si'`` uses an explicit
+            OMatG-style denoiser head eta.
         refine_final: one extra forward at t=1-eps used as final x_1 prediction.
         return_trajectory: return stacked x_t trajectory dict.
         fk_steering: optional particle steering config.
@@ -356,11 +476,31 @@ def euler_sample(
     x_t = pos_0.clone()
     x_t = x_t * pad_f
 
-    t_vals = torch.linspace(cfg.eps, 1.0 - cfg.eps, num_steps + 1,
-                            device=device, dtype=dtype)
+    u_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
+    if time_schedule == "uniform":
+        tau = u_vals
+    elif time_schedule == "high_t_power":
+        # More, smaller steps near t=1. beta=1 recovers uniform; larger beta
+        # spends progressively more resolution at high t.
+        beta = max(float(time_schedule_beta), 1.0)
+        tau = 1.0 - torch.pow(1.0 - u_vals, beta)
+    elif time_schedule == "low_t_power":
+        beta = max(float(time_schedule_beta), 1.0)
+        tau = torch.pow(u_vals, beta)
+    elif time_schedule == "beta_train":
+        # Deterministic quantile grid matching the train-time Beta(alpha, 1)
+        # sampling used by the beta-scheduled SI run. For alpha=2 this is
+        # tau=sqrt(u), giving more solver points at high t.
+        alpha = max(float(time_schedule_beta), 1.0)
+        tau = torch.pow(u_vals, 1.0 / alpha)
+    else:
+        raise ValueError(f"Unknown time_schedule={time_schedule!r}")
+    t_vals = cfg.eps + (1.0 - 2.0 * cfg.eps) * tau
 
     traj: List[torch.Tensor] = [x_t.clone()] if return_trajectory else []
     energy_traj: Optional[torch.Tensor] = None
+    if solver not in ("euler", "heun"):
+        raise ValueError(f"Unknown solver={solver!r}; expected 'euler' or 'heun'")
     if fk_steering is not None:
         energy_traj = torch.empty((B, 0), device=device, dtype=dtype)
         if B % fk_steering.num_particles != 0:
@@ -376,9 +516,45 @@ def euler_sample(
     # This preserves the all-atom COM=0 invariant the model trained on
     # (non-movable atoms are frozen at pos_0; centering movable atoms keeps
     # ads COM stable, matching the model's ads_center_rel head assumptions).
-    def _sde_step(x: torch.Tensor, v_in: torch.Tensor, t_s: float,
-                  dt_s: float) -> torch.Tensor:
+    def _sde_drift_noise(
+        x: torch.Tensor,
+        v_in: torch.Tensor,
+        t_s: float,
+        dt_s: float,
+        eta: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n_movable = movable_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        if sde_mode == "omatg_si":
+            if eta is None:
+                raise ValueError(
+                    "sde_mode='omatg_si' requires model_forward to return "
+                    "{'pred_x1': ..., 'eta': ...}"
+                )
+            t_tensor = torch.full((B,), t_s, device=device, dtype=dtype)
+            gamma_t = si_gamma(
+                t_tensor, si_gamma_schedule, si_gamma_sigma, eps=cfg.eps,
+            ).view(B, 1, 1).to(dtype)
+            eps_t = si_epsilon(
+                t_tensor, si_epsilon_schedule, si_epsilon_scale, eps=cfg.eps,
+            ).view(B, 1, 1).to(dtype)
+            if (gamma_t <= 0).any() and (eps_t > 0).any():
+                raise ValueError(
+                    "OMatG SI SDE requires gamma(t)>0 whenever epsilon(t)>0; "
+                    f"got schedule={si_gamma_schedule!r}, sigma={si_gamma_sigma}"
+                )
+
+            # OMatG drift: b_theta - epsilon/gamma * eta_theta. We keep the
+            # existing AdsorbGen COM-preserving movable noise so non-movable
+            # slab atoms remain exactly frozen during sampling.
+            drift = v_in - (eps_t / gamma_t.clamp_min(cfg.eps)) * eta.to(dtype) * movable_f
+            if noise is None:
+                noise = torch.randn(x.shape, device=device, dtype=dtype) * movable_f
+                noise_com = noise.sum(dim=1, keepdim=True) / n_movable
+                noise = (noise - noise_com * movable_f) * movable_f
+            noise_term = torch.sqrt((2.0 * eps_t * dt_s).clamp_min(0.0)) * noise
+            return drift, noise_term
 
         # Centering of v, x over movable atoms (AtomMOF's score formula).
         x_com = (x * movable_f).sum(dim=1, keepdim=True) / n_movable
@@ -399,23 +575,59 @@ def euler_sample(
             score = score * movable_f
 
         # Zero-mean noise on movable atoms (preserves COM).
-        noise = torch.randn(x.shape, device=device, dtype=dtype) * movable_f
-        noise_com = noise.sum(dim=1, keepdim=True) / n_movable
-        noise = (noise - noise_com * movable_f) * movable_f
+        if noise is None:
+            noise = torch.randn(x.shape, device=device, dtype=dtype) * movable_f
+            noise_com = noise.sum(dim=1, keepdim=True) / n_movable
+            noise = (noise - noise_com * movable_f) * movable_f
 
         drift = v_in + 0.5 * g2 * score
-        return x + drift * dt_s + (g2 * dt_s) ** 0.5 * noise
+        noise_term = (g2 * dt_s) ** 0.5 * noise
+        return drift, noise_term
+
+    def _sde_step(
+        x: torch.Tensor,
+        v_in: torch.Tensor,
+        t_s: float,
+        dt_s: float,
+        eta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        drift, noise_term = _sde_drift_noise(x, v_in, t_s, dt_s, eta=eta)
+        return x + drift * dt_s + noise_term
+
+    def _constrain(x: torch.Tensor) -> torch.Tensor:
+        return (x * movable_f + pos_0 * (1 - movable_f)) * pad_f
+
+    def _velocity_from_output(
+        model_out,
+        x: torch.Tensor,
+        t_s: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(model_out, dict):
+            pred_out = model_out["pred_x1"]
+            eta_out = model_out.get("eta")
+        else:
+            pred_out = model_out
+            eta_out = None
+        if cfg.prediction_type == "v":
+            v_out = pred_out
+        else:
+            v_out = (pred_out - x) / max(1.0 - t_s, cfg.eps)
+        return pred_out, v_out * movable_f, eta_out
 
     for i in range(num_steps):
         t_scalar = float(t_vals[i].item())
         dt = float((t_vals[i + 1] - t_vals[i]).item())
         t = t_vals[i].expand(B)
 
-        pred = model_forward(x_t, t)
+        model_out = model_forward(x_t, t)
+        pred, v, eta = _velocity_from_output(model_out, x_t, t_scalar)
 
         if fk_steering is not None and t_scalar >= fk_steering.fk_start_time \
                 and (i % fk_steering.resampling_interval == 0):
             # FK steering scores positions, so for v-pred we map to x_1 first.
+            # Resampling happens before the Euler/Heun step.  For Heun, the
+            # predictor-corrector then uses the resampled x_t/pred/eta together,
+            # so particle ancestry stays aligned across the two drift estimates.
             if cfg.prediction_type == "v":
                 pred_x_1_for_fk = pos_0 + pred
             else:
@@ -435,26 +647,42 @@ def euler_sample(
 
             x_t = x_t[idx]
             pred = pred[idx]
+            if eta is not None:
+                eta = eta[idx]
             energy_traj = energy_traj[idx]
 
-        # Velocity on absolute coords:
-        #   x1-mode  -> v = (pred_x_1 - x_t) / (1-t)
-        #   v-mode   -> model directly outputs v = x_1 - x_0 (constant under
-        #               linear flow, so dx/dt = v at every t).
-        if cfg.prediction_type == "v":
-            v = pred
-        else:
-            v = (pred - x_t) / max(1.0 - t_scalar, cfg.eps)
-        v = v * movable_f
+        if solver == "heun":
+            if use_sde:
+                drift0, noise_term = _sde_drift_noise(x_t, v, t_scalar, dt, eta=eta)
+                x_pred = _constrain(x_t + drift0 * dt + noise_term)
+            else:
+                drift0 = v
+                noise_term = torch.zeros_like(x_t)
+                x_pred = _constrain(x_t + drift0 * dt)
 
-        if use_sde:
-            x_t = _sde_step(x_t, v, t_scalar, dt)
+            t_next_scalar = float(t_vals[i + 1].item())
+            t_next = t_vals[i + 1].expand(B)
+            model_out_next = model_forward(x_pred, t_next)
+            _, v_next, eta_next = _velocity_from_output(model_out_next, x_pred, t_next_scalar)
+            if use_sde:
+                drift1, _ = _sde_drift_noise(
+                    x_pred,
+                    v_next,
+                    t_next_scalar,
+                    dt,
+                    eta=eta_next,
+                    noise=torch.zeros_like(x_t),
+                )
+                x_t = x_t + 0.5 * (drift0 + drift1) * dt + noise_term
+            else:
+                x_t = x_t + 0.5 * (drift0 + v_next) * dt
+        elif use_sde:
+            x_t = _sde_step(x_t, v, t_scalar, dt, eta=eta)
         else:
             x_t = x_t + v * dt
 
         # Freeze non-movable atoms at pos_0, zero out padding
-        x_t = x_t * movable_f + pos_0 * (1 - movable_f)
-        x_t = x_t * pad_f
+        x_t = _constrain(x_t)
 
         if return_trajectory:
             traj.append(x_t.clone())
@@ -462,6 +690,8 @@ def euler_sample(
     if refine_final:
         t_final = t_vals[-1].expand(B)
         pred_final = model_forward(x_t, t_final)
+        if isinstance(pred_final, dict):
+            pred_final = pred_final["pred_x1"]
         if cfg.prediction_type == "v":
             x_1_final = pos_0 + pred_final
         else:

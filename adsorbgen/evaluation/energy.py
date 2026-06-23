@@ -55,7 +55,10 @@ class UMAEnergy(nn.Module):
         self.model_name = model_name
         self.task_name = task_name
         self.normalize_per_atom = normalize_per_atom
-        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if str(device_str).startswith("cuda"):
+            device_str = "cuda"
+        self._device = str(device_str)
         self.predictor = pretrained_mlip.get_predict_unit(
             model_name, device=self._device
         )
@@ -102,6 +105,91 @@ class UMAEnergy(nn.Module):
             n_atoms = pad_mask.sum(dim=1).to(energy.dtype).clamp_min(1.0)
             energy = energy / n_atoms
         return energy
+
+
+class UMAForce(nn.Module):
+    """UMA single-point forces over a padded batch.
+
+    The force model is used as a detached Langevin-parametrization input. It
+    follows the same padded-batch to fairchem AtomicData conversion as
+    :class:`UMAEnergy`, but scatters the concatenated force output back to
+    ``(B, N, 3)`` with zeros on padding.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "uma-s-1p2",
+        device: str | None = None,
+        task_name: str = "oc20",
+    ):
+        super().__init__()
+        from fairchem.core import pretrained_mlip  # noqa: F401
+
+        self.model_name = model_name
+        self.task_name = task_name
+        device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # fairchem's pretrained_mlip API accepts only "cuda" or "cpu".
+        # Lightning/worker code may pass torch device strings such as
+        # "cuda:3"; the current CUDA device has already been selected there.
+        if str(device_str).startswith("cuda"):
+            device_str = "cuda"
+        self._device = str(device_str)
+        self.predictor = pretrained_mlip.get_predict_unit(
+            model_name, device=self._device,
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        cart_coords: torch.Tensor,
+        cell: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        pad_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        from fairchem.core.datasets import data_list_collater
+        from fairchem.core.datasets.atomic_data import AtomicData
+
+        B, N, _ = cart_coords.shape
+        coords_np = cart_coords.detach().cpu().numpy()
+        cell_np = cell.detach().cpu().numpy()
+        nums_np = atomic_numbers.detach().cpu().numpy()
+        pad_cpu = pad_mask.detach().cpu().bool()
+        pad_np = pad_cpu.numpy()
+
+        data_list = []
+        counts = []
+        for i in range(B):
+            m = pad_np[i]
+            counts.append(int(m.sum()))
+            atoms = Atoms(
+                numbers=nums_np[i][m],
+                positions=coords_np[i][m],
+                cell=cell_np[i],
+                pbc=True,
+            )
+            data_list.append(
+                AtomicData.from_ase(
+                    atoms,
+                    task_name=self.task_name,
+                    r_edges=False,
+                    r_data_keys=["spin", "charge"],
+                )
+            )
+
+        batch = data_list_collater(data_list, otf_graph=True)
+        out = self.predictor.predict(batch)
+        forces_cat = out["forces"].detach().to(
+            cart_coords.device, dtype=cart_coords.dtype,
+        )
+        forces = cart_coords.new_zeros((B, N, 3))
+        start = 0
+        for i, n in enumerate(counts):
+            end = start + n
+            if n:
+                idx = pad_cpu[i].to(device=cart_coords.device)
+                forces[i, idx] = forces_cat[start:end]
+            start = end
+        return forces
 
 
 class UMARelaxer:

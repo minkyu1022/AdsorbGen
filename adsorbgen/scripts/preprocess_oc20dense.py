@@ -84,8 +84,10 @@ def _entry_from_traj(
             fixed[np.asarray(idx, dtype=int)] = 1
 
     movable = ((tags == 1) | (tags == 2)) & (fixed == 0)
+    preprocess_shift = np.zeros((3,), dtype=np.float32)
     if movable.any():
         center = pos_init[movable].mean(axis=0, keepdims=True).astype(np.float32)
+        preprocess_shift = (-center).reshape(3).astype(np.float32)
         pos_init = pos_init - center
         pos_relaxed = pos_relaxed - center
 
@@ -104,6 +106,8 @@ def _entry_from_traj(
         "system_key": system_key,
         "config_key": config_key,
         "anomaly": 0,  # OC20-Dense is curated; no per-sample OC20 anomaly label
+        "preprocess_shift": preprocess_shift,
+        "preprocess_shift_mode": "pos_movable",
     }
 
 

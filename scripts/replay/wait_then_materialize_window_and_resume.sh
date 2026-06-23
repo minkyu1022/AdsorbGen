@@ -10,6 +10,7 @@ TRAIN_OUT="${TRAIN_OUT:-/home/irteam/runs/ID_mlip_pairdist_only_1x_bs64_window_2
 EPOCHS="${EPOCHS:-150}"
 WINDOW_EV="${WINDOW_EV:-0.1}"
 GT_INDEX="${GT_INDEX:-/home/irteam/data/replay/gt_index_by_sid_oc20_lbfgs.pkl}"
+ADSORBATES_PKL="${ADSORBATES_PKL:-/home1/irteam/AdsorbGen/data/pkls/adsorbates.pkl}"
 TRAIN_LMDBS=(${TRAIN_LMDBS:-/home/irteam/data/processed_ID/is2res_train.lmdb /home/irteam/data/processed_ID/is2res_val.lmdb})
 
 mkdir -p "${REPLAY_DIR}/logs" "${OUT_DATA_DIR}" "${TRAIN_OUT}"
@@ -38,14 +39,24 @@ echo "[auto-window] replay complete; merging best-success report" >> "${LOG}"
 "${PYTHON_BIN}" "${REPO}/scripts/replay/merge_self_improve_successes.py" \
   --out-dir "${REPLAY_DIR}" >> "${LOG}" 2>&1
 
-TRAIN_LMDB="${OUT_DATA_DIR}/is2res_train_val_window_${WINDOW_EV}ev.lmdb"
-echo "[auto-window] materializing ${TRAIN_LMDB}" >> "${LOG}"
+RAW_TRAIN_LMDB="${OUT_DATA_DIR}/is2res_train_val_window_${WINDOW_EV}ev.raw.lmdb"
+TRAIN_LMDB="${OUT_DATA_DIR}/is2res_train_val_window_${WINDOW_EV}ev.unwrap_centered.lmdb"
+echo "[auto-window] materializing raw window LMDB ${RAW_TRAIN_LMDB}" >> "${LOG}"
 env PYTHONPATH="${REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" "${REPO}/scripts/replay/materialize_window_lmdb.py" \
   --train-lmdb "${TRAIN_LMDBS[@]}" \
   --gt-index "${GT_INDEX}" \
   --replay-dir "${REPLAY_DIR}" \
   --window-ev "${WINDOW_EV}" \
-  --out-lmdb "${TRAIN_LMDB}" >> "${LOG}" 2>&1
+  --out-lmdb "${RAW_TRAIN_LMDB}" >> "${LOG}" 2>&1
+
+echo "[auto-window] unwrap/center window LMDB ${TRAIN_LMDB}" >> "${LOG}"
+rm -f "${TRAIN_LMDB}" "${TRAIN_LMDB}-lock"
+env PYTHONPATH="${REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m adsorbgen.scripts.unwrap_preprocess \
+  --src "${RAW_TRAIN_LMDB}" \
+  --dst "${TRAIN_LMDB}" \
+  --adsorbates-pkl "${ADSORBATES_PKL}" \
+  --center-mode relaxed_all \
+  --pbc-axes xy >> "${LOG}" 2>&1
 
 echo "[auto-window] launching window-buffer resume training to epoch ${EPOCHS}" >> "${LOG}"
 setsid -f bash -c "

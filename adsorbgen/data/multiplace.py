@@ -23,12 +23,22 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from adsorbgen.data.dataset import DEFAULT_ADSORBATES_PKL, PreprocessedDisplacementDataset
+from adsorbgen.data.dataset import (
+    DEFAULT_ADSORBATES_PKL,
+    PreprocessedDisplacementDataset,
+    load_gaussian_ads_stats,
+    load_pristine_slab_db,
+    lookup_pristine_slab_pos,
+)
 
 _PRIOR_MODE_MAP = {
     "random":            "random",
     "heuristic":         "heuristic",
     "random_heuristic":  "random_site_heuristic_placement",
+}
+
+_CUSTOM_PRIOR_MODES = {
+    "gaussian_ads_train_stats",
 }
 
 
@@ -48,14 +58,28 @@ class MultiPlacementDataset(Dataset):
         num_placements: int,
         adsorbates_pkl_path: str = DEFAULT_ADSORBATES_PKL,
         max_samples: Optional[int] = None,
+        unique_by_system_key: bool = False,
         prior_mode: str = "random_heuristic",
         interstitial_gap: float = 0.1,
         provide_ads_ref_pos: bool = False,
+        slab_source: str = "initial",
+        pristine_slabs: str = "",
+        pristine_index: str = "",
+        gaussian_ads_stats: str = "",
+        gaussian_ads_std_scale: float = 1.0,
     ):
+        if slab_source not in ("initial", "pristine_relaxed"):
+            raise ValueError("slab_source must be 'initial' or 'pristine_relaxed'")
+        if slab_source == "pristine_relaxed" and not pristine_slabs:
+            raise ValueError("slab_source='pristine_relaxed' requires pristine_slabs")
+        self.slab_source = str(slab_source)
+        self.pristine_slabs = str(pristine_slabs or "")
+        self.pristine_index = str(pristine_index or "")
         self.base = PreprocessedDisplacementDataset(
             lmdb_path,
             max_samples=max_samples,
-            recenter=True,
+            unique_by_system_key=unique_by_system_key,
+            recenter=(self.slab_source == "initial"),
             training_aug=False,
             provide_ads_ref_pos=provide_ads_ref_pos,
             adsorbates_pkl=adsorbates_pkl_path,
@@ -66,13 +90,21 @@ class MultiPlacementDataset(Dataset):
         self._ads_db: Optional[dict] = None
         self._cache_base_i: int = -1
         self._cache_placements: Optional[List[dict]] = None
-        if prior_mode not in _PRIOR_MODE_MAP:
+        if prior_mode not in _PRIOR_MODE_MAP and prior_mode not in _CUSTOM_PRIOR_MODES:
             raise ValueError(
-                f"prior_mode must be one of {list(_PRIOR_MODE_MAP)}, got {prior_mode!r}"
+                f"prior_mode must be one of "
+                f"{list(_PRIOR_MODE_MAP) + sorted(_CUSTOM_PRIOR_MODES)}, got {prior_mode!r}"
             )
         self.prior_mode = prior_mode
-        self._fairchem_mode = _PRIOR_MODE_MAP[prior_mode]
+        self._fairchem_mode = _PRIOR_MODE_MAP.get(prior_mode)
         self.interstitial_gap = float(interstitial_gap)
+        self.gaussian_ads_stats = str(gaussian_ads_stats or "")
+        self.gaussian_ads_std_scale = float(gaussian_ads_std_scale)
+        if self.prior_mode == "gaussian_ads_train_stats":
+            load_gaussian_ads_stats(self.gaussian_ads_stats)
+        self._pristine_db = None
+        self._pristine_sid_to_key = None
+        self._pristine_system_to_key = None
 
     def __len__(self) -> int:
         return len(self.base) * self.K
@@ -81,6 +113,17 @@ class MultiPlacementDataset(Dataset):
         if self._ads_db is None:
             with open(self._ads_pkl_path, "rb") as f:
                 self._ads_db = pickle.load(f)
+
+    def _ensure_pristine_db(self) -> None:
+        if self.slab_source != "pristine_relaxed":
+            return
+        if self._pristine_db is None:
+            db, sid_to_key, system_to_key = load_pristine_slab_db(
+                self.pristine_slabs, self.pristine_index,
+            )
+            self._pristine_db = db
+            self._pristine_sid_to_key = sid_to_key
+            self._pristine_system_to_key = system_to_key
 
     def _generate(self, base_i: int) -> List[dict]:
         from ase import Atoms
@@ -107,6 +150,42 @@ class MultiPlacementDataset(Dataset):
         ads_idx = np.where(tags == 2)[0]
         if ads_idx.size == 0:
             raise RuntimeError(f"sample {base_i}: no tag==2 adsorbate atoms")
+        if self.slab_source == "pristine_relaxed":
+            self._ensure_pristine_db()
+            pristine = lookup_pristine_slab_pos(
+                self._pristine_db or {},
+                self._pristine_sid_to_key or {},
+                self._pristine_system_to_key or {},
+                int(sample["sid"].item()) if "sid" in sample else -1,
+                sample.get("system_key", None),
+            )
+            if pristine is None or pristine.shape[0] != slab_idx.size:
+                got = None if pristine is None else pristine.shape
+                raise RuntimeError(
+                    f"sample {base_i}: pristine slab lookup failed "
+                    f"expected_slab_atoms={slab_idx.size} got={got}"
+                )
+            pos[slab_idx] = pristine.astype(np.float64, copy=False)
+
+        if self.prior_mode == "gaussian_ads_train_stats":
+            mean, std = load_gaussian_ads_stats(self.gaussian_ads_stats)
+            placements = []
+            for _ in range(self.K):
+                pos_out = pos.astype(np.float32).copy()
+                sample_ads = np.random.randn(ads_idx.size, 3).astype(np.float32)
+                pos_out[ads_idx] = sample_ads * (
+                    std[None, :] * np.float32(self.gaussian_ads_std_scale)
+                ) + mean[None, :]
+                new_sample = dict(sample)
+                if self.slab_source == "pristine_relaxed":
+                    pos_rel = sample["pos_relaxed"].numpy().astype(np.float32).copy()
+                    shift = -pos_out.mean(axis=0, keepdims=True)
+                    pos_out = pos_out + shift
+                    pos_rel = pos_rel + shift
+                    new_sample["pos_relaxed"] = torch.from_numpy(pos_rel)
+                new_sample["pos"] = torch.from_numpy(pos_out)
+                placements.append(new_sample)
+            return placements
 
         canonical_atoms = self._ads_db[ads_id][0]
         canonical_nums = list(canonical_atoms.get_atomic_numbers())
@@ -150,6 +229,12 @@ class MultiPlacementDataset(Dataset):
             pos_out[slab_idx] = new_pos[:n_slab]
             pos_out[ads_idx] = new_pos[n_slab:]
             new_sample = dict(sample)
+            if self.slab_source == "pristine_relaxed":
+                pos_rel = sample["pos_relaxed"].numpy().astype(np.float32).copy()
+                shift = -pos_out.mean(axis=0, keepdims=True)
+                pos_out = pos_out + shift
+                pos_rel = pos_rel + shift
+                new_sample["pos_relaxed"] = torch.from_numpy(pos_rel)
             new_sample["pos"] = torch.from_numpy(pos_out)
             placements.append(new_sample)
 

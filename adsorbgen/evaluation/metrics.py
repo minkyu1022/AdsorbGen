@@ -12,11 +12,10 @@ Mapping from our record fields to DetectTrajAnomaly inputs:
 
     init_atoms        = pos_ref   (unrelaxed initial placement, IS)
     final_atoms       = pos_pred  (model prediction of the relaxed adslab)
-    final_slab_atoms  = pristine relaxed slab (no adsorbate), looked up via
-                        sid/system_key -> slab_key -> pristine pkl. Falls back to
-                        ``pos_gt`` restricted to tag != 2 when the pristine
-                        DB is not provided or the sid is missing — used so
-                        runs from before the pristine extraction still work.
+    final_slab_atoms  = bare relaxed slab (no adsorbate), looked up via
+                        sid/system_key -> slab_key -> pristine/bare slab pkl.
+                        Missing reference data is a hard error; surface-change
+                        metrics must not silently fall back to ``pos_gt``.
 
 Cutoffs are left at DetectTrajAnomaly defaults (surface_change=1.5,
 desorption=1.5). ``valid_rate_strict = 1 - any(4 flags OR overlap)``.
@@ -110,7 +109,7 @@ def _pristine_record_pos(rec) -> Optional[np.ndarray]:
     if rec is None:
         return None
     if isinstance(rec, dict):
-        rec = rec.get("pos")
+        rec = rec.get("pos_relaxed", rec.get("pos"))
     if rec is None:
         return None
     return np.asarray(rec, dtype=np.float64)
@@ -240,13 +239,24 @@ def _build_atoms_triplet(record: Dict):
 
     slab_mask = tags_np != 2
 
-    pristine_pos = _lookup_pristine_pos(record.get("sid"), record.get("system_key"))
-    if pristine_pos is not None and pristine_pos.shape[0] == int(slab_mask.sum()):
-        slab_positions = pristine_pos
-    else:
-        # Fallback: pos_gt[slab_mask]. Used when the pristine DB isn't loaded
-        # or the sid wasn't indexed (e.g. older sample dumps).
-        slab_positions = pos_gt.numpy()[slab_mask]
+    sid = record.get("sid")
+    system_key = record.get("system_key")
+    pristine_pos = _lookup_pristine_pos(sid, system_key)
+    if pristine_pos is None:
+        raise RuntimeError(
+            "bare/pristine slab reference is required for surface-change "
+            f"evaluation but was not found for sid={sid!r} system_key={system_key!r}. "
+            "Pass --pristine-slabs/--pristine-index or "
+            "--val-pristine-slabs/--val-pristine-index."
+        )
+    expected_slab_atoms = int(slab_mask.sum())
+    if pristine_pos.shape[0] != expected_slab_atoms:
+        raise RuntimeError(
+            "bare/pristine slab atom-count mismatch for surface-change "
+            f"evaluation: sid={sid!r} system_key={system_key!r} "
+            f"reference_atoms={pristine_pos.shape[0]} expected_slab_atoms={expected_slab_atoms}."
+        )
+    slab_positions = pristine_pos
 
     final_slab_atoms = Atoms(
         numbers=z_np[slab_mask],
@@ -355,6 +365,11 @@ def compute_anomaly_metrics(
 ) -> Dict:
     """6-axis validity metrics. See module docstring for the protocol."""
     pristine_loaded = load_pristine_context(pristine_slabs, pristine_sid_index)
+    if pristine_loaded is None:
+        raise ValueError(
+            "compute_anomaly_metrics requires bare/pristine slab references. "
+            "Pass --pristine-slabs/--pristine-index; fallback to pos_gt is disabled."
+        )
     if workers and workers > 1:
         import multiprocessing as mp
 
@@ -400,13 +415,11 @@ def compute_anomaly_metrics(
             "desorbed": "DetectTrajAnomaly.is_adsorbate_desorbed (final=pos_pred)",
             "intercalated": "DetectTrajAnomaly.is_adsorbate_intercalated (final=pos_pred)",
             "surf_changed": (
-                "DetectTrajAnomaly.has_surface_changed (final_slab=pristine "
-                "relaxed slab via sid/system_key index, fallback pos_gt[tag!=2] if missing)"
-                if pristine_loaded is not None
-                else "DetectTrajAnomaly.has_surface_changed (final_slab=pos_gt[tag!=2])"
+                "DetectTrajAnomaly.has_surface_changed "
+                "(final_slab=bare/pristine relaxed slab via sid/system_key index)"
             ),
         },
-        "pristine_slab_reference": pristine_loaded is not None,
+        "pristine_slab_reference": True,
     }
     return {"aggregate": aggregate, "per_sample": per_sample}
 

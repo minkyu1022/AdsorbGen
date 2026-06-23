@@ -329,6 +329,8 @@ def main() -> None:
     ap.add_argument("--flow-steps", type=int, default=50)
     ap.add_argument("--flow-batch-size", type=int, default=32)
     ap.add_argument("--prior-mode", default="random_heuristic")
+    ap.add_argument("--gaussian-ads-stats", type=str, default="")
+    ap.add_argument("--gaussian-ads-std-scale", type=float, default=1.0)
     ap.add_argument("--use-sde", action="store_true",
                     help="use AtomMOF-style SDE sampling")
     ap.add_argument("--refine-final", action="store_true")
@@ -348,6 +350,8 @@ def main() -> None:
     ap.add_argument("--fk-energy", type=str, default="uma",
                     choices=["zero", "uma"])
     ap.add_argument("--fk-uma-model", type=str, default="uma-s-1p1")
+    ap.add_argument("--langevin-uma-model", type=str, default="uma-s-1p2")
+    ap.add_argument("--langevin-uma-task", type=str, default="oc20")
     ap.add_argument("--uma-model", default="uma-s-1p1")
     ap.add_argument("--uma-task", default="oc20")
     ap.add_argument("--uma-fmax", type=float, default=0.05)
@@ -469,7 +473,19 @@ def main() -> None:
     if device.type != "cuda":
         raise RuntimeError("CUDA is required")
     model, flow_cfg = load_model_from_ckpt(Path(args.ckpt), device)
-    use_ads_ref = bool(getattr(_model_cfg(model), "use_ads_ref_pos", False))
+    model_cfg = _model_cfg(model)
+    use_ads_ref = bool(getattr(model_cfg, "use_ads_ref_pos", False))
+    langevin_force_model = None
+    if bool(getattr(model_cfg, "use_langevin_param", False)):
+        if str(getattr(model_cfg, "langevin_eval_on", "x_t")) != "x_t":
+            raise ValueError("Only langevin_eval_on='x_t' is implemented")
+        from adsorbgen.evaluation.energy import UMAForce  # noqa: WPS433
+
+        langevin_force_model = UMAForce(
+            model_name=args.langevin_uma_model,
+            task_name=args.langevin_uma_task,
+            device=str(device),
+        )
 
     from fairchem.core import pretrained_mlip
     from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
@@ -522,6 +538,8 @@ def main() -> None:
         PlacementPriorDataset(
             p,
             prior_mode=args.prior_mode,
+            gaussian_ads_stats=args.gaussian_ads_stats,
+            gaussian_ads_std_scale=args.gaussian_ads_std_scale,
             max_samples=None,
             provide_ads_ref_pos=use_ads_ref,
             skip_anomaly=False,
@@ -576,6 +594,14 @@ def main() -> None:
             extra = {}
             if use_ads_ref:
                 extra["ads_ref_pos"] = _b["ads_ref_pos"]
+            if langevin_force_model is not None:
+                extra["mlip_force"] = langevin_force_model(
+                    x_t.detach(),
+                    _b["cell"],
+                    _b["atomic_numbers"],
+                    _b["pad_mask"],
+                )
+                extra["langevin_prediction_type"] = flow_cfg.prediction_type
             return model(
                 pos=_b["pos"],
                 x_t=x_t,
@@ -681,13 +707,14 @@ def main() -> None:
             ads_id = job["ads_id"]
 
             status = "ok"
+            geom_valid = False
             valid = False
             success = False
             anomaly = None
             e_ref = float(rep["E_sys_ref"])
             e_sys = float(relaxed["E_sys"])
             improvement = float(e_ref - e_sys) if np.isfinite(e_sys) else float("nan")
-            if not relaxed["converged"] or not np.isfinite(e_sys):
+            if not np.isfinite(e_sys):
                 status = "uma_unconverged"
             else:
                 ar = _score_record_anomaly({
@@ -701,10 +728,13 @@ def main() -> None:
                     "tags": torch.as_tensor(tags, dtype=torch.long),
                     "cell": torch.as_tensor(cell, dtype=torch.float32),
                 })
-                valid, anomaly = status_from_anomaly(ar)
+                geom_valid, anomaly = status_from_anomaly(ar)
+                valid = bool(geom_valid and relaxed["converged"])
+                if not relaxed["converged"]:
+                    status = "uma_unconverged"
                 if valid and improvement > args.success_margin:
                     success = True
-                elif not valid:
+                elif not geom_valid:
                     status = str(anomaly)
 
             row = {
@@ -722,6 +752,7 @@ def main() -> None:
                 "fmax": float(relaxed["fmax"]),
                 "n_steps": int(relaxed["n_steps"]),
                 "converged": bool(relaxed["converged"]),
+                "geom_valid": bool(geom_valid),
                 "valid": bool(valid),
                 "success": bool(success),
                 "status": status,

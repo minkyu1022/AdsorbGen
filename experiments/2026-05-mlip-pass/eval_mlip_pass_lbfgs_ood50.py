@@ -214,10 +214,15 @@ def main() -> None:
     ap.add_argument("--flow-steps", type=int, default=50)
     ap.add_argument("--flow-batch-size", type=int, default=32)
     ap.add_argument("--prior-mode", default="random_heuristic")
+    ap.add_argument("--slab-source", default="initial", choices=["initial", "pristine_relaxed"])
+    ap.add_argument("--placement-pristine-slabs", default="")
+    ap.add_argument("--placement-pristine-index", default="")
     ap.add_argument("--use-sde", action="store_true")
     ap.add_argument("--refine-final", action="store_true")
     ap.add_argument("--uma-model", default="uma-s-1p1")
     ap.add_argument("--uma-task", default="oc20")
+    ap.add_argument("--langevin-uma-model", default="uma-s-1p2")
+    ap.add_argument("--langevin-uma-task", default="oc20")
     ap.add_argument("--uma-fmax", type=float, default=0.01)
     ap.add_argument("--uma-max-steps", type=int, default=300)
     ap.add_argument("--lbfgs-maxstep", type=float, default=0.04)
@@ -269,7 +274,19 @@ def main() -> None:
     if device.type != "cuda":
         raise RuntimeError("CUDA is required for this evaluation shard")
     model, flow_cfg = load_model_from_ckpt(Path(args.ckpt), device)
-    use_ads_ref = bool(getattr(_model_cfg(model), "use_ads_ref_pos", False))
+    model_cfg = _model_cfg(model)
+    use_ads_ref = bool(getattr(model_cfg, "use_ads_ref_pos", False))
+    langevin_force_model = None
+    if bool(getattr(model_cfg, "use_langevin_param", False)):
+        if str(getattr(model_cfg, "langevin_eval_on", "x_t")) != "x_t":
+            raise ValueError("Only langevin_eval_on='x_t' is implemented")
+        from adsorbgen.evaluation.energy import UMAForce  # noqa: WPS433
+
+        langevin_force_model = UMAForce(
+            model_name=args.langevin_uma_model,
+            task_name=args.langevin_uma_task,
+            device=str(device),
+        )
 
     from fairchem.core import pretrained_mlip
     from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
@@ -284,6 +301,9 @@ def main() -> None:
         max_samples=None,
         provide_ads_ref_pos=use_ads_ref,
         skip_anomaly=False,
+        slab_source=args.slab_source,
+        pristine_slabs=args.placement_pristine_slabs,
+        pristine_index=args.placement_pristine_index,
     )
 
     rows = []
@@ -315,6 +335,14 @@ def main() -> None:
             extra = {}
             if use_ads_ref:
                 extra["ads_ref_pos"] = _b["ads_ref_pos"]
+            if langevin_force_model is not None:
+                extra["mlip_force"] = langevin_force_model(
+                    x_t.detach(),
+                    _b["cell"],
+                    _b["atomic_numbers"],
+                    _b["pad_mask"],
+                )
+                extra["langevin_prediction_type"] = flow_cfg.prediction_type
             return model(
                 pos=_b["pos"],
                 x_t=x_t,
@@ -366,8 +394,8 @@ def main() -> None:
             success = False
             anomaly = None
             e_ads = float("nan")
-            if not relaxed["converged"] or not np.isfinite(relaxed["E_sys"]):
-                status = "uma_unconverged"
+            if not np.isfinite(relaxed["E_sys"]):
+                status = "uma_nonfinite"
             else:
                 e_ads = float(relaxed["E_sys"] - ref["E_slab"] - ref["E_adsorbate"])
                 rec = {
@@ -384,6 +412,8 @@ def main() -> None:
                 ar = _score_record_anomaly(rec)
                 if ar.get("valid_strict"):
                     valid = True
+                    if not relaxed["converged"]:
+                        status = "uma_unconverged"
                     success = bool(e_ads - ref["E_ads_ref"] <= args.epsilon_succ)
                 else:
                     flags = [

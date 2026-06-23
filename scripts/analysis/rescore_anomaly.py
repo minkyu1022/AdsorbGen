@@ -3,13 +3,16 @@
 Walks ``runs/<variant>/search_samples*.pt`` (and optionally
 ``runs/<variant>/epoch_scan/ep*_samples.pt``), applies
 ``adsorbgen.evaluation.metrics.compute_anomaly_metrics`` with the user-defined protocol
-(init=pos_ref, final=pos_pred, final_slab=pos_gt[tag!=2], default cutoffs),
+(init=pos_ref, final=pos_pred, final_slab=bare/pristine relaxed slab, default cutoffs),
 and writes ``search_metrics_anomaly.json`` / ``ep{e}_metrics_anomaly.json``
 next to each source file.
 
 Usage:
     PYTHONPATH=AdsorbGen python scripts/analysis/rescore_anomaly.py \
-        --runs-root runs --workers 16 [--epoch-scan] [--variants v2,v11-cross-attn]
+        --runs-root runs --workers 16 \
+        --pristine-slabs /path/to/bare_slabs.pkl \
+        --pristine-index /path/to/sid_index.pkl \
+        [--epoch-scan] [--variants v2,v11-cross-attn]
 """
 
 from __future__ import annotations
@@ -59,11 +62,23 @@ def _discover_epoch_scan(runs_root: Path, variants: List[str] | None) -> List[Tu
     return out
 
 
-def _run_one(label: str, src: Path, dst: Path, workers: int) -> dict:
+def _run_one(
+    label: str,
+    src: Path,
+    dst: Path,
+    workers: int,
+    pristine_slabs: str,
+    pristine_index: str,
+) -> dict:
     t0 = time.time()
     blob = torch.load(src, map_location="cpu", weights_only=False)
     records = blob["records"]
-    metrics = compute_anomaly_metrics(records, workers=workers)
+    metrics = compute_anomaly_metrics(
+        records,
+        workers=workers,
+        pristine_slabs=pristine_slabs,
+        pristine_sid_index=pristine_index,
+    )
     metrics["meta"] = blob.get("meta", {})
     metrics["meta"]["source"] = str(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +110,11 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--only-missing", action="store_true",
                     help="skip source files whose output already exists")
+    ap.add_argument("--pristine-slabs", type=str, required=True,
+                    help="bare/pristine relaxed-slab pkl used for surface-change checks")
+    ap.add_argument("--pristine-index", "--pristine-sid-index",
+                    dest="pristine_index", type=str, required=True,
+                    help="sid/system_key -> bare slab key index pkl")
     args = ap.parse_args()
 
     variants = [s.strip() for s in args.variants.split(",")] if args.variants else None
@@ -109,7 +129,14 @@ def main() -> None:
     print(f"[rescore] {len(tasks)} files to process, workers={args.workers}", flush=True)
     for name, src, dst in tasks:
         label = f"{name}/{src.name}"
-        _run_one(label, src, dst, workers=args.workers)
+        _run_one(
+            label,
+            src,
+            dst,
+            workers=args.workers,
+            pristine_slabs=args.pristine_slabs,
+            pristine_index=args.pristine_index,
+        )
 
 
 if __name__ == "__main__":

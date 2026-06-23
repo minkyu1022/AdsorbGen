@@ -94,6 +94,9 @@ def _make_forward(
     model: torch.nn.Module,
     batch: dict,
     movable_mask: torch.Tensor,
+    prediction_type: str,
+    langevin_force_model: Optional[torch.nn.Module] = None,
+    return_si_eta: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build the model_forward closure for euler_sample.
 
@@ -121,6 +124,16 @@ def _make_forward(
                     "provide it; construct the dataset with provide_ads_ref_pos=True"
                 )
             extra["ads_ref_pos"] = batch["ads_ref_pos"]
+        if langevin_force_model is not None:
+            extra["mlip_force"] = langevin_force_model(
+                x_t.detach(),
+                batch["cell"],
+                batch["atomic_numbers"],
+                batch["pad_mask"],
+            )
+            extra["langevin_prediction_type"] = prediction_type
+        if return_si_eta:
+            extra["return_si_eta"] = True
         out = model(
             pos=batch["pos"],
             x_t=x_t,
@@ -132,8 +145,9 @@ def _make_forward(
             cell=batch["cell"],
             **extra,
         )
+        out_main = out["pred_x1"] if isinstance(out, dict) else out
         if use_self_cond:
-            state["prev_pred"] = out.detach()
+            state["prev_pred"] = out_main.detach()
         return out
     return _f
 
@@ -152,16 +166,42 @@ def main():
 
     p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--flow-eps", type=float, default=1e-5)
+    p.add_argument("--time-schedule",
+                   choices=["uniform", "high_t_power", "low_t_power"],
+                   default="uniform",
+                   help="Inference-only integration time grid. high_t_power uses smaller steps near t=1.")
+    p.add_argument("--time-schedule-beta", type=float, default=2.0,
+                   help="Power for non-uniform time schedules. beta=1 is uniform; beta>1 strengthens clustering.")
     p.add_argument("--prediction-type", type=str, choices=["x1", "v"], default=None,
                    help="Override sampler prediction type. Default: read from args.json.")
     p.add_argument("--prior-mode",
                    choices=["random", "heuristic", "random_heuristic",
-                            "harmonic_uniform", "harmonic_centered", "catflow_center_rel"],
+                            "harmonic_uniform", "harmonic_centered", "catflow_center_rel",
+                            "gaussian_ads_train_stats"],
                    default="random_heuristic")
     p.add_argument("--use-placement-prior", action="store_true",
                    help="for K=1, replace adsorbate pos with a fresh fairchem placement, matching training sample_eval")
+    p.add_argument("--unique-by-system-key", action="store_true",
+                   help="keep only the first entry per system_key, matching training sample_eval on Dense")
     p.add_argument("--interstitial-gap", type=float, default=0.1)
+    p.add_argument("--gaussian-ads-stats", type=str, default="",
+                   help="NPZ with mean/std arrays for prior_mode=gaussian_ads_train_stats")
+    p.add_argument("--gaussian-ads-std-scale", type=float, default=1.0)
     p.add_argument("--use-sde", action="store_true")
+    p.add_argument("--sde-mode", choices=["atommof", "omatg_si"], default="atommof",
+                   help="SDE sampler: legacy AtomMOF heuristic or OMatG SI eta drift.")
+    p.add_argument("--sde-epsilon-schedule",
+                   choices=["constant", "vanishing_1mt", "zero"],
+                   default="vanishing_1mt",
+                   help="epsilon(t) schedule for --sde-mode omatg_si.")
+    p.add_argument("--sde-epsilon-scale", type=float, default=1.0,
+                   help="epsilon scale for --sde-mode omatg_si.")
+    p.add_argument("--sde-gamma-schedule",
+                   choices=["none", "sqrt_t1mt", "linear_1mt"],
+                   default=None,
+                   help="gamma schedule for OMatG SI SDE. Default: checkpoint args.")
+    p.add_argument("--sde-gamma-sigma", type=float, default=None,
+                   help="gamma sigma for OMatG SI SDE. Default: checkpoint args.")
     p.add_argument("--refine-final", action="store_true")
 
     p.add_argument("--fk-particles", type=int, default=0,
@@ -176,11 +216,23 @@ def main():
                    help="FK steering energy: 'zero' (uniform dummy) or 'uma' (UMA-s MLIP)")
     p.add_argument("--fk-uma-model", type=str, default="uma-s-1p1",
                    help="fairchem pretrained model id when --fk-energy=uma")
+    p.add_argument("--langevin-uma-model", type=str, default=None,
+                   help="fairchem pretrained model id for LP force input. "
+                        "Default: train args value or uma-s-1p2.")
+    p.add_argument("--langevin-uma-task", type=str, default=None,
+                   help="fairchem task name for LP force input. "
+                        "Default: train args value or oc20.")
 
     p.add_argument("--num-samples", type=int, default=1,
                    help="K: number of random_site_heuristic_placement starts per system")
     p.add_argument("--adsorbates-pkl", type=str, default=DEFAULT_ADSORBATES_PKL,
                    help="path to fairchem's adsorbates.pkl for K-placement and ads_ref_pos")
+    p.add_argument("--slab-source", choices=["auto", "initial", "pristine_relaxed"], default="auto",
+                   help="Slab x0 source. auto reads checkpoint args.json.")
+    p.add_argument("--pristine-slabs", type=str, default="",
+                   help="Bare-slab relaxed pkl, required for slab_source=pristine_relaxed.")
+    p.add_argument("--pristine-index", "--pristine-sid-index", dest="pristine_sid_index",
+                   type=str, default="", help="sid/system index for --pristine-slabs.")
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--train-args-json", type=str, default=None,
@@ -230,8 +282,40 @@ def main():
     missing, unexpected = model.load_state_dict(sd, strict=False)
     print(f"[ckpt] {ckpt_path} missing={len(missing)} unexpected={len(unexpected)}", flush=True)
     model.eval()
+    if bool(getattr(model_cfg, "use_langevin_param", False)) and \
+            str(getattr(model_cfg, "langevin_eval_on", "x_t")) != "x_t":
+        raise ValueError("Only langevin_eval_on='x_t' is implemented for inference")
     use_ads_ref = bool(getattr(model_cfg, "use_ads_ref_pos", False))
     movable_mode = str(train_args_blob.get("train_args", {}).get("movable_mode", "surface_ads"))
+    saved_train_args = train_args_blob.get("train_args", {})
+    si_gamma_schedule = str(
+        args.sde_gamma_schedule
+        or saved_train_args.get("gamma_schedule")
+        or train_args_blob.get("trainer", {}).get("gamma_schedule")
+        or "none"
+    )
+    si_gamma_sigma = float(
+        args.sde_gamma_sigma
+        if args.sde_gamma_sigma is not None
+        else (
+            saved_train_args.get("gamma_sigma")
+            if saved_train_args.get("gamma_sigma") is not None
+            else train_args_blob.get("trainer", {}).get("gamma_sigma", 0.0)
+        )
+    )
+    if args.use_sde and args.sde_mode == "omatg_si":
+        if not bool(getattr(model_cfg, "use_si_denoiser", False)):
+            raise ValueError("--sde-mode omatg_si requires a checkpoint trained with --use-si-denoiser")
+        if si_gamma_schedule == "none" or si_gamma_sigma <= 0.0:
+            raise ValueError(
+                "--sde-mode omatg_si requires stochastic gamma from training "
+                "or explicit --sde-gamma-schedule/--sde-gamma-sigma"
+            )
+    slab_source = str(saved_train_args.get("slab_source", "initial"))
+    if args.slab_source != "auto":
+        slab_source = str(args.slab_source)
+    pristine_slabs = str(args.pristine_slabs or saved_train_args.get("pristine_slabs", ""))
+    pristine_index = str(args.pristine_sid_index or saved_train_args.get("pristine_sid_index", ""))
 
     K = max(int(args.num_samples), 1)
     if K > 1:
@@ -240,8 +324,18 @@ def main():
             num_placements=K,
             adsorbates_pkl_path=args.adsorbates_pkl,
             max_samples=args.max_samples,
+            unique_by_system_key=args.unique_by_system_key,
             prior_mode=args.prior_mode,
             provide_ads_ref_pos=use_ads_ref,
+            slab_source=slab_source,
+            pristine_slabs=pristine_slabs,
+            pristine_index=pristine_index,
+            gaussian_ads_stats=args.gaussian_ads_stats or saved_train_args.get("gaussian_ads_stats", ""),
+            gaussian_ads_std_scale=float(
+                args.gaussian_ads_std_scale
+                if args.gaussian_ads_std_scale is not None
+                else saved_train_args.get("gaussian_ads_std_scale", 1.0)
+            ),
         )
         n_base = len(dataset.base)
         print(f"[data] {n_base} base systems × K={K} placements (mode={args.prior_mode}) from {args.lmdb}", flush=True)
@@ -249,10 +343,20 @@ def main():
         dataset = PlacementPriorDataset(
             args.lmdb,
             max_samples=args.max_samples,
+            unique_by_system_key=args.unique_by_system_key,
             prior_mode=args.prior_mode,
             interstitial_gap=args.interstitial_gap,
             provide_ads_ref_pos=use_ads_ref,
             adsorbates_pkl=args.adsorbates_pkl,
+            slab_source=slab_source,
+            pristine_slabs=pristine_slabs,
+            pristine_index=pristine_index,
+            gaussian_ads_stats=args.gaussian_ads_stats or saved_train_args.get("gaussian_ads_stats", ""),
+            gaussian_ads_std_scale=float(
+                args.gaussian_ads_std_scale
+                if args.gaussian_ads_std_scale is not None
+                else saved_train_args.get("gaussian_ads_std_scale", 1.0)
+            ),
         )
         n_base = len(dataset)
         print(
@@ -264,6 +368,7 @@ def main():
         dataset = PreprocessedDisplacementDataset(
             args.lmdb,
             max_samples=args.max_samples,
+            unique_by_system_key=args.unique_by_system_key,
             provide_ads_ref_pos=use_ads_ref,
             adsorbates_pkl=args.adsorbates_pkl,
         )
@@ -283,6 +388,28 @@ def main():
     )
 
     flow_cfg = FlowConfig(eps=args.flow_eps, prediction_type=prediction_type)
+    langevin_force_model = None
+    if bool(getattr(model_cfg, "use_langevin_param", False)):
+        from adsorbgen.evaluation.energy import UMAForce  # noqa: WPS433
+
+        lp_train_args = {
+            **(train_args_blob.get("trainer", {}) or {}),
+            **(train_args_blob.get("train_args", {}) or {}),
+        }
+        langevin_force_model = UMAForce(
+            model_name=args.langevin_uma_model
+            or lp_train_args.get("langevin_uma_model")
+            or "uma-s-1p2",
+            task_name=args.langevin_uma_task
+            or lp_train_args.get("langevin_uma_task")
+            or "oc20",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        print(
+            f"[lp] UMA force ({langevin_force_model.model_name}, "
+            f"task={langevin_force_model.task_name}) loaded for Langevin parametrization",
+            flush=True,
+        )
 
     # FK steering: energy model is loaded once and then rebound to each
     # replicated batch inside the sampling loop via make_fk_energy_fn.
@@ -363,7 +490,14 @@ def main():
         else:
             raise ValueError(f"Unknown movable_mode={movable_mode!r}")
 
-        model_forward = _make_forward(model=model, batch=work, movable_mask=movable)
+        model_forward = _make_forward(
+            model=model,
+            batch=work,
+            movable_mask=movable,
+            prediction_type=flow_cfg.prediction_type,
+            langevin_force_model=langevin_force_model,
+            return_si_eta=bool(args.use_sde and args.sde_mode == "omatg_si"),
+        )
 
         want_traj = args.save_trajectories > 0 and len(all_records) < args.save_trajectories
         sample_out = euler_sample(
@@ -377,6 +511,13 @@ def main():
             refine_final=args.refine_final,
             return_trajectory=want_traj,
             fk_steering=fk_cfg,
+            sde_mode=args.sde_mode,
+            si_gamma_schedule=si_gamma_schedule,
+            si_gamma_sigma=si_gamma_sigma,
+            si_epsilon_schedule=args.sde_epsilon_schedule,
+            si_epsilon_scale=args.sde_epsilon_scale,
+            time_schedule=args.time_schedule,
+            time_schedule_beta=args.time_schedule_beta,
         )
         if want_traj:
             x_out = sample_out["x_out"]
@@ -493,11 +634,20 @@ def main():
                 "prediction_type": prediction_type,
                 "prior_mode": args.prior_mode,
                 "use_sde": args.use_sde,
+                "sde_mode": args.sde_mode if args.use_sde else None,
+                "sde_gamma_schedule": si_gamma_schedule if args.use_sde else None,
+                "sde_gamma_sigma": si_gamma_sigma if args.use_sde else None,
+                "sde_epsilon_schedule": args.sde_epsilon_schedule if args.use_sde else None,
+                "sde_epsilon_scale": args.sde_epsilon_scale if args.use_sde else None,
                 "refine_final": args.refine_final,
                 "fk_particles": args.fk_particles,
                 "fk_potential": args.fk_potential if args.fk_particles > 0 else None,
                 "fk_energy": args.fk_energy if args.fk_particles > 0 else None,
                 "fk_uma_model": args.fk_uma_model if args.fk_particles > 0 and args.fk_energy == "uma" else None,
+                "use_langevin_param": bool(getattr(model_cfg, "use_langevin_param", False)),
+                "langevin_uma_model": (
+                    langevin_force_model.model_name if langevin_force_model is not None else None
+                ),
                 "num_placements": K,
                 "n_samples": len(all_records),
                 "n_trajectories_saved": sum(1 for r in all_records if "x_trajectory" in r),

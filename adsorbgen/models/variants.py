@@ -142,6 +142,19 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "use_ads_ref_pos": True,
         "use_ads_specific_head": True,
     },
+    # Same as v0-ads-ref-adshead, but replaces the RoPE channels of each
+    # attention score with pair-level MIC 3D RoPE. Coordinates, target, and
+    # auxiliary losses are unchanged.
+    "v0-ads-ref-adshead-rope": {
+        "atom_s": 512, "atom_z": 256, "skip_stage_gates": True,
+        "dec_pair_bias": True, "dist_kernel": "gaussian",
+        "dist_rbf_num": 16, "dist_rbf_cutoff": 6.0,
+        "use_ads_ref_pos": True,
+        "use_ads_specific_head": True,
+        "use_pair_rope": True,
+        "pair_rope_dim": 48,
+        "pair_rope_base": 10.0,
+    },
     # Base-size version of the CatFlow-style center+relative-position head.
     # Same capacity as v0-ads-ref-adshead (about 102M params), but replaces the
     # ads-specific per-atom coordinate projection with an adsorbate center head

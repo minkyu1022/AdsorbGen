@@ -317,8 +317,11 @@ def main():
                        "random", "heuristic", "random_heuristic",
                        "harmonic_uniform", "harmonic_centered",
                        "catflow_center_rel",
+                       "gaussian_ads_train_stats",
                    ],
                    default="random_heuristic")
+    p.add_argument("--gaussian-ads-stats", type=str, default="")
+    p.add_argument("--gaussian-ads-std-scale", type=float, default=1.0)
     p.add_argument("--uma-model", default="uma-s-1p1")
     p.add_argument("--uma-fmax", type=float, default=0.05)
     p.add_argument("--uma-max-steps", type=int, default=100)
@@ -462,6 +465,8 @@ def main():
 
         cfg = ReplayEvalConfig(
             prior_mode=args.prior_mode,
+            gaussian_ads_stats=args.gaussian_ads_stats,
+            gaussian_ads_std_scale=args.gaussian_ads_std_scale,
             num_systems=int(len(my_picked)),
             num_placements=args.num_placements,
             flow_steps=args.flow_steps,

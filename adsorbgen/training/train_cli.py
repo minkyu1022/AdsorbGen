@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -53,6 +54,7 @@ from adsorbgen.replay.eval import (  # noqa: E402
 from adsorbgen.flow import (  # noqa: E402
     adsorbate_pair_distance_losses,
     FlowConfig, euler_sample, flow_loss_split, interpolate_xt, sample_t,
+    selected_pair_distance_l1_loss, si_denoiser_loss, si_gamma, si_gamma_dot,
     smooth_lddt_loss, x1_loss, x1_loss_split,
 )
 from adsorbgen.models.dit import DiTDenoiserConfig  # noqa: E402
@@ -78,14 +80,23 @@ class AdsorbGenModule(L.LightningModule):
         sample_eval_every_epochs: int = 0,
         sample_eval_max_samples: int = 64,
         sample_eval_steps: int = 10,
+        sample_eval_energy_cover_dir: str = "",
+        sample_eval_energy_uma_model: str = "uma-s-1p1",
+        sample_eval_energy_uma_task: str = "oc20",
+        sample_eval_energy_batch_size: int = 32,
+        sample_eval_energy_success_margin: float = 0.1,
         pristine_slabs: str = "",
         pristine_sid_index: str = "",
+        val_pristine_slabs: str = "",
+        val_pristine_sid_index: str = "",
+        slab_source: str = "initial",
         loss_surf_weight: float = 5.0,
         loss_ads_weight: float = 1.0,
         lddt_ads_ads_weight: float = 0.0,
         lddt_cutoff: float = 15.0,
         lddt_time_weight: float = 0.0,
         ads_pair_l1_weight: float = 0.0,
+        movable_pair_l1_weight: float = 0.0,
         ads_bond_l1_weight: float = 0.0,
         ads_nonbonded_clash_weight: float = 0.0,
         ads_bond_factor: float = 1.25,
@@ -96,6 +107,17 @@ class AdsorbGenModule(L.LightningModule):
         # --- stochastic interpolant noise (SiT-style finetuning) ---
         gamma_schedule: str = "none",       # "none", "sqrt_t1mt", "linear_1mt"
         gamma_sigma: float = 0.0,           # noise scale; 0 disables
+        train_time_sampling: str = "uniform",
+        train_time_beta_alpha: float = 2.0,
+        train_time_beta_beta: float = 1.0,
+        loss_target: str = "auto",
+        si_denoiser_loss_weight: float = 0.0,
+        si_denoiser_mask: str = "movable",
+        gaussian_ads_stats: str = "",
+        gaussian_ads_std_scale: float = 1.0,
+        # --- Langevin parametrization force input ---
+        langevin_uma_model: str = "uma-s-1p2",
+        langevin_uma_task: str = "oc20",
         # --- replay params ---
         use_replay: bool = False,
         replay_buffer_path: str = "",      # runs/<out>/replay_buffer.pkl
@@ -127,6 +149,14 @@ class AdsorbGenModule(L.LightningModule):
         self.save_hyperparameters()
         self.model = build_model(model_cfg)
         self.flow_cfg = flow_cfg
+        self._langevin_force_model = None
+        self._langevin_enabled = bool(getattr(model_cfg, "use_langevin_param", False))
+        self._langevin_uma_model = str(langevin_uma_model)
+        self._langevin_uma_task = str(langevin_uma_task)
+        if self._langevin_enabled and str(getattr(model_cfg, "langevin_eval_on", "x_t")) != "x_t":
+            raise ValueError("Only langevin_eval_on='x_t' is implemented")
+        self._sample_eval_energy_model = None
+        self._sample_eval_energy_refs = None
         # Per-source sample_eval records keyed by val-dataloader name
         # (e.g. "dense", "is2re"). Populated in validation_step and drained
         # in on_validation_epoch_end. Source names come from the
@@ -193,6 +223,8 @@ class AdsorbGenModule(L.LightningModule):
             self._replay_scheduler = ReplayScheduler(
                 initial=ReplayEvalConfig(
                     prior_mode=replay_prior_mode,
+                    gaussian_ads_stats=gaussian_ads_stats,
+                    gaussian_ads_std_scale=gaussian_ads_std_scale,
                     num_systems=replay_initial_systems,
                     num_placements=replay_initial_placements,
                     flow_steps=replay_flow_steps,
@@ -205,6 +237,8 @@ class AdsorbGenModule(L.LightningModule):
                 ),
                 scaled=ReplayEvalConfig(
                     prior_mode=replay_prior_mode,
+                    gaussian_ads_stats=gaussian_ads_stats,
+                    gaussian_ads_std_scale=gaussian_ads_std_scale,
                     num_systems=replay_scaled_systems,
                     num_placements=replay_scaled_placements,
                     flow_steps=replay_flow_steps,
@@ -238,10 +272,14 @@ class AdsorbGenModule(L.LightningModule):
             self.log("train/lddt_ads_ads_loss", losses["lddt_ads_ads"])
         if "ads_pair_l1" in losses:
             self.log("train/ads_pair_l1_loss", losses["ads_pair_l1"])
+        if "movable_pair_l1" in losses:
+            self.log("train/movable_pair_l1_loss", losses["movable_pair_l1"])
         if "ads_bond_l1" in losses:
             self.log("train/ads_bond_l1_loss", losses["ads_bond_l1"])
         if "ads_nonbonded_clash" in losses:
             self.log("train/ads_nonbonded_clash_loss", losses["ads_nonbonded_clash"])
+        if "si_eta" in losses:
+            self.log("train/si_eta_loss", losses["si_eta"])
         return weighted
 
     # -- validation --
@@ -270,10 +308,14 @@ class AdsorbGenModule(L.LightningModule):
             self.log(f"val/{src}/lddt_ads_ads_loss", losses["lddt_ads_ads"], sync_dist=True, add_dataloader_idx=False)
         if "ads_pair_l1" in losses:
             self.log(f"val/{src}/ads_pair_l1_loss", losses["ads_pair_l1"], sync_dist=True, add_dataloader_idx=False)
+        if "movable_pair_l1" in losses:
+            self.log(f"val/{src}/movable_pair_l1_loss", losses["movable_pair_l1"], sync_dist=True, add_dataloader_idx=False)
         if "ads_bond_l1" in losses:
             self.log(f"val/{src}/ads_bond_l1_loss", losses["ads_bond_l1"], sync_dist=True, add_dataloader_idx=False)
         if "ads_nonbonded_clash" in losses:
             self.log(f"val/{src}/ads_nonbonded_clash_loss", losses["ads_nonbonded_clash"], sync_dist=True, add_dataloader_idx=False)
+        if "si_eta" in losses:
+            self.log(f"val/{src}/si_eta_loss", losses["si_eta"], sync_dist=True, add_dataloader_idx=False)
 
         # accumulate sample-eval records on EVERY rank (each rank owns its
         # DDP shard of the val data); on_validation_epoch_end then all_reduces
@@ -449,8 +491,20 @@ class AdsorbGenModule(L.LightningModule):
             recs = self._sample_eval_records.get(src, [])
             if recs:
                 disp = compute_displacement_metrics(recs)
-                _ps = getattr(self.hparams, "pristine_slabs", "") or None
-                _psi = getattr(self.hparams, "pristine_sid_index", "") or None
+                if src == "dense":
+                    _ps = (
+                        getattr(self.hparams, "val_pristine_slabs", "")
+                        or getattr(self.hparams, "pristine_slabs", "")
+                        or None
+                    )
+                    _psi = (
+                        getattr(self.hparams, "val_pristine_sid_index", "")
+                        or getattr(self.hparams, "pristine_sid_index", "")
+                        or None
+                    )
+                else:
+                    _ps = getattr(self.hparams, "pristine_slabs", "") or None
+                    _psi = getattr(self.hparams, "pristine_sid_index", "") or None
                 strict = compute_anomaly_metrics(
                     recs,
                     pristine_slabs=_ps,
@@ -479,19 +533,51 @@ class AdsorbGenModule(L.LightningModule):
                 disp_sum = 0.0
                 disp_sq_sum = 0.0
                 disp_count = 0
+            valid_energy_mask = [p.get("is_any_anomaly") is False for p in per] if recs else []
+            energy_stats = self._sample_eval_energy_stats(recs, valid_mask=valid_energy_mask)
+            structure_stats = self._sample_eval_structure_stats(recs)
 
             # Pack into a single tensor for one all_reduce call.
             # Order: [n_samples, overlap, dissoc, desorbed, intercalated,
             #         surf_changed, any_anomaly, n_errors,
-            #         disp_sum, disp_sq_sum, disp_count]
+            #         disp_sum, disp_sq_sum, disp_count,
+            #         energy_count, energy_missing, energy_error,
+            #         energy_delta_sum, energy_abs_delta_sum,
+            #         energy_sq_delta_sum, energy_success_count,
+            #         valid_energy_count, valid_energy_missing, valid_energy_error,
+            #         valid_energy_delta_sum, valid_energy_abs_delta_sum,
+            #         valid_energy_sq_delta_sum, valid_energy_success_count]
             packed = torch.tensor(
                 [n_local, cnt["overlap"], cnt["dissoc"], cnt["desorbed"],
                  cnt["intercalated"], cnt["surf_changed"], cnt["any_anomaly"],
-                 cnt["n_errors"], disp_sum, disp_sq_sum, disp_count],
+                 cnt["n_errors"], disp_sum, disp_sq_sum, disp_count,
+                 energy_stats["count"], energy_stats["missing"], energy_stats["errors"],
+                 energy_stats["delta_sum"], energy_stats["abs_delta_sum"],
+                 energy_stats["sq_delta_sum"], energy_stats["success_count"],
+                 energy_stats["valid_count"], energy_stats["valid_missing"],
+                 energy_stats["valid_errors"], energy_stats["valid_delta_sum"],
+                 energy_stats["valid_abs_delta_sum"], energy_stats["valid_sq_delta_sum"],
+                 energy_stats["valid_success_count"]],
                 dtype=torch.float64, device=self.device,
             )
             if ddp_active:
                 dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+            struct_values = []
+            for scope in ("all", "movable", "ads"):
+                s = structure_stats[scope]
+                struct_values.extend([
+                    s["n"],
+                    s["match"],
+                    s["sm_rms_sum"],
+                    s["sm_rms_count"],
+                    s["ordered_rms_sum"],
+                    s["ordered_rms_count"],
+                    s["errors"],
+                ])
+            struct_packed = torch.tensor(struct_values, dtype=torch.float64, device=self.device)
+            if ddp_active:
+                dist.all_reduce(struct_packed, op=dist.ReduceOp.SUM)
 
             n_global = int(packed[0].item())
             n_err_global = int(packed[7].item())
@@ -514,6 +600,49 @@ class AdsorbGenModule(L.LightningModule):
             self.log(f"{base}/intercalated_rate",  float(packed[4].item()) * inv,       rank_zero_only=True)
             self.log(f"{base}/surf_changed_rate",  float(packed[5].item()) * inv,       rank_zero_only=True)
             self.log(f"{base}/any_anomaly_rate",   float(packed[6].item()) * inv,       rank_zero_only=True)
+            energy_count = int(packed[11].item())
+            if energy_count > 0:
+                einv = 1.0 / energy_count
+                self.log(f"{base}/uma_sp_delta_E_sys_mean_eV", float(packed[14].item()) * einv, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_delta_E_sys_mae_eV", float(packed[15].item()) * einv, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_delta_E_sys_rmse_eV", float(packed[16].item() * einv) ** 0.5, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_energy_count", float(energy_count), rank_zero_only=True)
+                self.log(f"{base}/uma_sp_energy_missing_ref", float(packed[12].item()), rank_zero_only=True)
+                self.log(f"{base}/uma_sp_energy_errors", float(packed[13].item()), rank_zero_only=True)
+            valid_energy_count = int(packed[18].item())
+            if valid_energy_count > 0:
+                veinv = 1.0 / valid_energy_count
+                self.log(f"{base}/uma_sp_valid_delta_E_sys_mean_eV", float(packed[21].item()) * veinv, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_valid_delta_E_sys_mae_eV", float(packed[22].item()) * veinv, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_valid_delta_E_sys_rmse_eV", float(packed[23].item() * veinv) ** 0.5, rank_zero_only=True)
+                self.log(f"{base}/uma_sp_valid_energy_count", float(valid_energy_count), rank_zero_only=True)
+                self.log(f"{base}/uma_sp_valid_energy_missing_ref", float(packed[19].item()), rank_zero_only=True)
+                self.log(f"{base}/uma_sp_valid_energy_errors", float(packed[20].item()), rank_zero_only=True)
+            # Keep sample-eval structure logging focused: all-atom match/RMSD
+            # is the Goal-1 signal; per-scope n/error/movable/ads metrics add
+            # W&B noise without changing the decision.
+            off = 0  # scope="all"
+            struct_n = int(struct_packed[off].item())
+            struct_rms_count = int(struct_packed[off + 3].item())
+            ordered_rms_count = int(struct_packed[off + 5].item())
+            if struct_n > 0:
+                self.log(
+                    f"{base}/structure_all_match_rate",
+                    float(struct_packed[off + 1].item()) / struct_n,
+                    rank_zero_only=True,
+                )
+            if struct_rms_count > 0:
+                self.log(
+                    f"{base}/structure_all_sm_rms_A",
+                    float(struct_packed[off + 2].item()) / struct_rms_count,
+                    rank_zero_only=True,
+                )
+            if ordered_rms_count > 0:
+                self.log(
+                    f"{base}/structure_all_ordered_pbc_rms_A",
+                    float(struct_packed[off + 4].item()) / ordered_rms_count,
+                    rank_zero_only=True,
+                )
         self._sample_eval_records.clear()
 
     # -- optimizer --
@@ -544,6 +673,279 @@ class AdsorbGenModule(L.LightningModule):
             return movable & (batch["tags"] == 2)
         raise ValueError(f"Unknown movable_mode={mode!r}")
 
+    def _get_langevin_force_model(self):
+        if not self._langevin_enabled:
+            return None
+        if self._langevin_force_model is None:
+            from adsorbgen.evaluation.energy import UMAForce  # noqa: WPS433
+
+            self._langevin_force_model = UMAForce(
+                model_name=self._langevin_uma_model,
+                task_name=self._langevin_uma_task,
+                device=str(self.device),
+            )
+        return self._langevin_force_model
+
+    def _load_sample_eval_energy_refs(self) -> dict[str, float]:
+        if self._sample_eval_energy_refs is not None:
+            return self._sample_eval_energy_refs
+        cover_dir = str(getattr(self.hparams, "sample_eval_energy_cover_dir", "") or "")
+        if not cover_dir:
+            self._sample_eval_energy_refs = {}
+            return self._sample_eval_energy_refs
+
+        def _refs_from_records(raw) -> dict[str, float]:
+            refs = {}
+            items = raw.values() if isinstance(raw, dict) else raw
+            for rec in items:
+                if not isinstance(rec, dict):
+                    continue
+                system_key = rec.get("system_id") or rec.get("system_key")
+                energy = rec.get("e_sys_relaxed", rec.get("E_sys_min"))
+                if system_key is not None and energy is not None:
+                    refs[str(system_key)] = float(energy)
+            return refs
+
+        root = Path(cover_dir)
+        if root.is_file():
+            if root.suffix == ".pkl":
+                with root.open("rb") as f:
+                    raw = pickle.load(f)
+            else:
+                with root.open() as f:
+                    raw = json.load(f)
+            self._sample_eval_energy_refs = _refs_from_records(raw)
+            return self._sample_eval_energy_refs
+
+        path = root / "gt_results" / "global_minima.json"
+        if path.exists():
+            with path.open() as f:
+                raw = json.load(f)
+            self._sample_eval_energy_refs = _refs_from_records(raw)
+            return self._sample_eval_energy_refs
+
+        path = root / "oc20dense_mlip_global_min_by_system.pkl"
+        if path.exists():
+            with path.open("rb") as f:
+                raw = pickle.load(f)
+            self._sample_eval_energy_refs = _refs_from_records(raw)
+            return self._sample_eval_energy_refs
+
+        raise FileNotFoundError(
+            f"No supported sample-eval energy references under {root}. Expected "
+            "a .json/.pkl file, gt_results/global_minima.json, or "
+            "oc20dense_mlip_global_min_by_system.pkl"
+        )
+
+    def _get_sample_eval_energy_model(self):
+        if not str(getattr(self.hparams, "sample_eval_energy_cover_dir", "") or ""):
+            return None
+        if self._sample_eval_energy_model is None:
+            from adsorbgen.evaluation.energy import UMAEnergy  # noqa: WPS433
+
+            self._sample_eval_energy_model = UMAEnergy(
+                model_name=str(getattr(self.hparams, "sample_eval_energy_uma_model", "uma-s-1p1")),
+                task_name=str(getattr(self.hparams, "sample_eval_energy_uma_task", "oc20")),
+                device=str(self.device),
+                normalize_per_atom=False,
+            )
+        return self._sample_eval_energy_model
+
+    def _sample_eval_energy_stats(self, recs: list[dict], valid_mask: list[bool] | None = None) -> dict[str, float]:
+        stats = {
+            "count": 0,
+            "missing": 0,
+            "errors": 0,
+            "delta_sum": 0.0,
+            "abs_delta_sum": 0.0,
+            "sq_delta_sum": 0.0,
+            "success_count": 0,
+            "valid_count": 0,
+            "valid_missing": 0,
+            "valid_errors": 0,
+            "valid_delta_sum": 0.0,
+            "valid_abs_delta_sum": 0.0,
+            "valid_sq_delta_sum": 0.0,
+            "valid_success_count": 0,
+        }
+        if not recs:
+            return stats
+        if valid_mask is not None and len(valid_mask) != len(recs):
+            raise ValueError(
+                f"valid_mask length mismatch: {len(valid_mask)} != {len(recs)}"
+            )
+        refs = self._load_sample_eval_energy_refs()
+        if not refs:
+            return stats
+        model = self._get_sample_eval_energy_model()
+        if model is None:
+            return stats
+
+        usable: list[tuple[dict, float, bool]] = []
+        for idx, rec in enumerate(recs):
+            is_valid = bool(valid_mask[idx]) if valid_mask is not None else True
+            system_key = rec.get("system_key")
+            if system_key is None:
+                stats["missing"] += 1
+                if is_valid:
+                    stats["valid_missing"] += 1
+                continue
+            ref = refs.get(str(system_key))
+            if ref is None:
+                stats["missing"] += 1
+                if is_valid:
+                    stats["valid_missing"] += 1
+                continue
+            usable.append((rec, ref, is_valid))
+
+        chunk_size = max(int(getattr(self.hparams, "sample_eval_energy_batch_size", 32)), 1)
+        margin = float(getattr(self.hparams, "sample_eval_energy_success_margin", 0.1))
+        for start in range(0, len(usable), chunk_size):
+            chunk = usable[start:start + chunk_size]
+            try:
+                max_n = max(int(rec["pos_pred"].shape[0]) for rec, _, _ in chunk)
+                bsz = len(chunk)
+                pos = torch.zeros((bsz, max_n, 3), dtype=torch.float32, device=self.device)
+                cell = torch.zeros((bsz, 3, 3), dtype=torch.float32, device=self.device)
+                atomic_numbers = torch.zeros((bsz, max_n), dtype=torch.long, device=self.device)
+                pad_mask = torch.zeros((bsz, max_n), dtype=torch.bool, device=self.device)
+                refs_t = torch.empty((bsz,), dtype=torch.float32, device=self.device)
+                valid_t = torch.empty((bsz,), dtype=torch.bool, device=self.device)
+                for j, (rec, ref, is_valid) in enumerate(chunk):
+                    n = int(rec["pos_pred"].shape[0])
+                    pos[j, :n] = rec["pos_pred"].to(device=self.device, dtype=torch.float32)
+                    cell[j] = rec["cell"].to(device=self.device, dtype=torch.float32)
+                    atomic_numbers[j, :n] = rec["atomic_numbers"].to(device=self.device, dtype=torch.long)
+                    pad_mask[j, :n] = True
+                    refs_t[j] = float(ref)
+                    valid_t[j] = bool(is_valid)
+                e_pred = model(pos, cell, atomic_numbers, pad_mask)
+                delta = (e_pred - refs_t).detach()
+                finite = torch.isfinite(delta)
+                if finite.any():
+                    d = delta[finite].to(torch.float64)
+                    stats["count"] += int(d.numel())
+                    stats["delta_sum"] += float(d.sum().item())
+                    stats["abs_delta_sum"] += float(d.abs().sum().item())
+                    stats["sq_delta_sum"] += float((d * d).sum().item())
+                    stats["success_count"] += int((d <= margin).sum().item())
+                valid_finite = finite & valid_t
+                if valid_finite.any():
+                    dv = delta[valid_finite].to(torch.float64)
+                    stats["valid_count"] += int(dv.numel())
+                    stats["valid_delta_sum"] += float(dv.sum().item())
+                    stats["valid_abs_delta_sum"] += float(dv.abs().sum().item())
+                    stats["valid_sq_delta_sum"] += float((dv * dv).sum().item())
+                    stats["valid_success_count"] += int((dv <= margin).sum().item())
+                stats["errors"] += int((~finite).sum().item())
+                stats["valid_errors"] += int(((~finite) & valid_t).sum().item())
+            except Exception:
+                stats["errors"] += len(chunk)
+                stats["valid_errors"] += sum(1 for _, _, is_valid in chunk if is_valid)
+        return stats
+
+    def _sample_eval_structure_stats(self, recs: list[dict]) -> dict[str, dict[str, float]]:
+        scopes = ("all", "movable", "ads")
+        stats = {
+            scope: {
+                "n": 0,
+                "match": 0,
+                "sm_rms_sum": 0.0,
+                "sm_rms_count": 0,
+                "ordered_rms_sum": 0.0,
+                "ordered_rms_count": 0,
+                "errors": 0,
+            }
+            for scope in scopes
+        }
+        if not recs:
+            return stats
+
+        try:
+            import numpy as np  # noqa: WPS433
+            from pymatgen.analysis.structure_matcher import StructureMatcher  # noqa: WPS433
+            from pymatgen.core import Element, Lattice, Structure  # noqa: WPS433
+        except Exception:
+            for scope in scopes:
+                stats[scope]["errors"] += len(recs)
+            return stats
+
+        matcher = StructureMatcher(
+            ltol=0.3,
+            stol=0.5,
+            angle_tol=10.0,
+            primitive_cell=False,
+            scale=False,
+            attempt_supercell=False,
+        )
+
+        def _ordered_pbc_rms(pos_a, pos_b, lattice):
+            frac_a = lattice.get_fractional_coords(pos_a)
+            frac_b = lattice.get_fractional_coords(pos_b)
+            dfrac = frac_a - frac_b
+            dfrac -= np.round(dfrac)
+            dcart = np.asarray(dfrac) @ np.asarray(lattice.matrix)
+            return float(np.sqrt(np.mean(np.sum(dcart * dcart, axis=1))))
+
+        for rec in recs:
+            try:
+                pos_pred = rec["pos_pred"].detach().cpu().numpy()
+                pos_gt = rec["pos_gt"].detach().cpu().numpy()
+                cell = rec["cell"].detach().cpu().numpy()
+                atomic_numbers = rec["atomic_numbers"].detach().cpu().numpy()
+                tags = rec["tags"].detach().cpu().numpy()
+                movable = rec["movable_mask"].detach().cpu().numpy().astype(bool)
+                lattice = Lattice(cell)
+            except Exception:
+                for scope in scopes:
+                    stats[scope]["errors"] += 1
+                continue
+
+            masks = {
+                "all": np.ones(len(atomic_numbers), dtype=bool),
+                "movable": movable,
+                "ads": tags == 2,
+            }
+            for scope, mask in masks.items():
+                n_atoms = int(mask.sum())
+                if n_atoms <= 0:
+                    continue
+                s = stats[scope]
+                s["n"] += 1
+                try:
+                    idx = np.where(mask)[0]
+                    species = [Element.from_Z(int(z)) for z in atomic_numbers[idx]]
+                    pred = Structure(
+                        lattice,
+                        species,
+                        pos_pred[idx],
+                        coords_are_cartesian=True,
+                        to_unit_cell=True,
+                    )
+                    ref = Structure(
+                        lattice,
+                        species,
+                        pos_gt[idx],
+                        coords_are_cartesian=True,
+                        to_unit_cell=True,
+                    )
+                    ordered_rms = _ordered_pbc_rms(pos_pred[idx], pos_gt[idx], lattice)
+                    if np.isfinite(ordered_rms):
+                        s["ordered_rms_sum"] += ordered_rms
+                        s["ordered_rms_count"] += 1
+
+                    if matcher.fit(pred, ref):
+                        s["match"] += 1
+                        rms_pair = matcher.get_rms_dist(pred, ref)
+                        if rms_pair is not None and rms_pair[0] is not None:
+                            sm_rms = float(rms_pair[0])
+                            if np.isfinite(sm_rms):
+                                s["sm_rms_sum"] += sm_rms
+                                s["sm_rms_count"] += 1
+                except Exception:
+                    s["errors"] += 1
+        return stats
+
     def _compute_loss_split(self, batch):
         """Returns dict with 'total', 'surf', 'ads' loss tensors.
 
@@ -556,11 +958,28 @@ class AdsorbGenModule(L.LightningModule):
         pos, pos_rel = batch["pos"], batch["pos_relaxed"]
         cell, movable = batch["cell"], self._effective_movable_mask(batch)
         tags = batch["tags"]
+        model_cfg = self._model_cfg()
 
-        t = sample_t(pos.shape[0], self.flow_cfg, device=pos.device, dtype=pos.dtype)
+        t = sample_t(
+            pos.shape[0],
+            self.flow_cfg,
+            device=pos.device,
+            dtype=pos.dtype,
+            sampling=str(getattr(self.hparams, "train_time_sampling", "uniform")),
+            beta_alpha=float(getattr(self.hparams, "train_time_beta_alpha", 2.0)),
+            beta_beta=float(getattr(self.hparams, "train_time_beta_beta", 1.0)),
+        )
         x_t = interpolate_xt(pos, pos_rel, t, movable)
+        z = None
+        gamma_dot_t = None
 
-        use_center_rel = bool(getattr(self._model_cfg(), "use_ads_center_rel_head", False))
+        use_center_rel = bool(getattr(model_cfg, "use_ads_center_rel_head", False))
+        use_si_denoiser = (
+            bool(getattr(model_cfg, "use_si_denoiser", False))
+            or float(getattr(self.hparams, "si_denoiser_loss_weight", 0.0)) != 0.0
+        )
+        if use_center_rel and use_si_denoiser:
+            raise ValueError("OMatG-style SI denoiser is not implemented for center/rel head")
         ads_center_1 = ads_rel_pos_1 = None
         if use_center_rel:
             ads_mask = movable & (tags == 2)
@@ -582,12 +1001,8 @@ class AdsorbGenModule(L.LightningModule):
         gamma_sigma = float(self.hparams.get("gamma_sigma", 0.0))
         gamma_schedule = str(self.hparams.get("gamma_schedule", "none"))
         if gamma_sigma > 0.0 and gamma_schedule != "none":
-            if gamma_schedule == "sqrt_t1mt":
-                gamma_t = gamma_sigma * torch.sqrt(t * (1.0 - t))
-            elif gamma_schedule == "linear_1mt":
-                gamma_t = gamma_sigma * (1.0 - t)
-            else:
-                raise ValueError(f"Unknown gamma_schedule={gamma_schedule!r}")
+            gamma_t = si_gamma(t, gamma_schedule, gamma_sigma, eps=self.flow_cfg.eps)
+            gamma_dot_t = si_gamma_dot(t, gamma_schedule, gamma_sigma, eps=self.flow_cfg.eps)
             gt = gamma_t[:, None, None].to(x_t.dtype)
             mov_f = movable.unsqueeze(-1).to(x_t.dtype)
             z = torch.randn_like(x_t) * mov_f
@@ -607,6 +1022,22 @@ class AdsorbGenModule(L.LightningModule):
                 x_t = (x_t + gt * z * non_ads_mov_f) * (1.0 - ads_f) + ads_x_t * ads_f
             else:
                 x_t = x_t + gt * z
+        elif use_si_denoiser:
+            raise ValueError(
+                "OMatG-style SI denoiser requires stochastic interpolation noise; "
+                "set --gamma-schedule sqrt_t1mt and --gamma-sigma > 0"
+            )
+
+        mlip_force = None
+        langevin_force_model = self._get_langevin_force_model()
+        if langevin_force_model is not None:
+            with torch.no_grad():
+                mlip_force = langevin_force_model(
+                    x_t.detach(),
+                    cell,
+                    batch["atomic_numbers"],
+                    batch["pad_mask"],
+                )
 
         model_kwargs = dict(
             pos=pos, x_t=x_t, t=t,
@@ -614,31 +1045,85 @@ class AdsorbGenModule(L.LightningModule):
             movable_mask=movable, pad_mask=batch["pad_mask"],
             cell=cell,
         )
+        if mlip_force is not None:
+            model_kwargs["mlip_force"] = mlip_force
+            model_kwargs["langevin_prediction_type"] = self.flow_cfg.prediction_type
         if use_center_rel:
             model_kwargs["ads_center_t"] = ads_center_t
             model_kwargs["ads_rel_pos_t"] = ads_rel_pos_t
             model_kwargs["return_ads_components"] = True
-        if getattr(self._model_cfg(), "use_ads_ref_pos", False):
+        if use_si_denoiser:
+            model_kwargs["return_si_eta"] = True
+        if getattr(model_cfg, "use_ads_ref_pos", False):
             model_kwargs["ads_ref_pos"] = batch["ads_ref_pos"]
 
-        if getattr(self._model_cfg(), "use_self_cond", False) and torch.rand(()).item() < 0.5:
+        if getattr(model_cfg, "use_self_cond", False) and torch.rand(()).item() < 0.5:
             with torch.no_grad():
-                prev = self.model(**model_kwargs).detach()
+                prev_out = self.model(**model_kwargs)
+                prev = (prev_out["pred_x1"] if isinstance(prev_out, dict) else prev_out).detach()
             model_kwargs["prev_pred"] = prev
 
         pred = self.model(**model_kwargs)
+        pred_main = pred["pred_x1"] if isinstance(pred, dict) else pred
         if use_center_rel:
             losses = self._flow_loss_split_ads_center_rel(
                 pred, pos, pos_rel, movable, tags,
                 ads_center_1=ads_center_1,
                 ads_rel_pos_1=ads_rel_pos_1,
             )
+        elif z is not None:
+            # OMatG SI learns the stochastic velocity target
+            # dI/dt + gamma_dot(t) * z. For x1-prediction, regress the
+            # endpoint whose Euler velocity (xhat_1 - x_t)/(1-t) equals that
+            # target by default. If --loss-target=v is set, decouple the model
+            # output parameterization from the loss and apply a pure velocity
+            # loss even when the model outputs xhat_1.
+            gamma_dot = gamma_dot_t[:, None, None].to(pos.dtype)
+            si_velocity_target = (pos_rel - pos) + gamma_dot * z
+            loss_target = str(getattr(self.hparams, "loss_target", "auto") or "auto")
+            if loss_target == "auto":
+                loss_target = self.flow_cfg.prediction_type
+            if loss_target == "v":
+                if self.flow_cfg.prediction_type == "v":
+                    si_pred = pred_main
+                elif self.flow_cfg.prediction_type == "x1":
+                    one_minus_t = (1.0 - t).to(pos.dtype).view(pos.shape[0], 1, 1)
+                    si_pred = (pred_main - x_t) / one_minus_t.clamp_min(self.flow_cfg.eps)
+                else:
+                    raise ValueError(f"Unknown prediction_type={self.flow_cfg.prediction_type!r}")
+                si_target = si_velocity_target
+            elif loss_target == "x1":
+                if self.flow_cfg.prediction_type != "x1":
+                    raise ValueError("--loss-target=x1 requires --prediction-type=x1")
+                si_pred = pred_main
+                one_minus_t = (1.0 - t).to(pos.dtype).view(pos.shape[0], 1, 1)
+                si_target = x_t + one_minus_t * si_velocity_target
+            else:
+                raise ValueError(f"Unknown loss_target={loss_target!r}")
+            losses = x1_loss_split(
+                si_pred,
+                si_target,
+                movable,
+                tags,
+                loss_type=self.hparams.loss_type,
+            )
         else:
             losses = flow_loss_split(
-                pred, pos, pos_rel, movable, tags,
+                pred_main, pos, pos_rel, movable, tags,
                 loss_type=self.hparams.loss_type,
                 prediction_type=self.flow_cfg.prediction_type,
             )
+        if use_si_denoiser:
+            if not isinstance(pred, dict) or "eta" not in pred:
+                raise ValueError("SI denoiser training requires model output dict with 'eta'")
+            eta_mask_name = str(getattr(self.hparams, "si_denoiser_mask", "movable"))
+            if eta_mask_name == "movable":
+                eta_mask = movable
+            elif eta_mask_name == "adsorbate":
+                eta_mask = movable & (tags == 2)
+            else:
+                raise ValueError(f"Unknown si_denoiser_mask={eta_mask_name!r}")
+            losses["si_eta"] = si_denoiser_loss(pred["eta"], z, eta_mask)
         lddt_w = float(getattr(self.hparams, "lddt_ads_ads_weight", 0.0))
         if lddt_w != 0.0:
             if self.flow_cfg.prediction_type == "x1":
@@ -678,6 +1163,19 @@ class AdsorbGenModule(L.LightningModule):
                 bond_factor=float(getattr(self.hparams, "ads_bond_factor", 1.25)),
                 clash_factor=float(getattr(self.hparams, "ads_clash_factor", 0.75)),
             ))
+        movable_pair_w = float(getattr(self.hparams, "movable_pair_l1_weight", 0.0))
+        if movable_pair_w != 0.0:
+            if self.flow_cfg.prediction_type == "x1":
+                pred_x1 = pred["pred_x1"] if isinstance(pred, dict) else pred
+            elif self.flow_cfg.prediction_type == "v":
+                pred_x1 = pos + (pred["pred_x1"] if isinstance(pred, dict) else pred)
+            else:
+                raise ValueError(f"Unknown prediction_type={self.flow_cfg.prediction_type!r}")
+            losses["movable_pair_l1"] = selected_pair_distance_l1_loss(
+                pred_x1,
+                pos_rel,
+                movable,
+            )
         return losses
 
     def _flow_loss_split_ads_center_rel(
@@ -794,10 +1292,14 @@ class AdsorbGenModule(L.LightningModule):
             weighted = weighted + float(self.hparams.lddt_ads_ads_weight) * losses["lddt_ads_ads"]
         if "ads_pair_l1" in losses:
             weighted = weighted + float(self.hparams.ads_pair_l1_weight) * losses["ads_pair_l1"]
+        if "movable_pair_l1" in losses:
+            weighted = weighted + float(self.hparams.movable_pair_l1_weight) * losses["movable_pair_l1"]
         if "ads_bond_l1" in losses:
             weighted = weighted + float(self.hparams.ads_bond_l1_weight) * losses["ads_bond_l1"]
         if "ads_nonbonded_clash" in losses:
             weighted = weighted + float(self.hparams.ads_nonbonded_clash_weight) * losses["ads_nonbonded_clash"]
+        if "si_eta" in losses:
+            weighted = weighted + float(self.hparams.si_denoiser_loss_weight) * losses["si_eta"]
         return weighted
 
     def _model_cfg(self):
@@ -821,6 +1323,7 @@ class AdsorbGenModule(L.LightningModule):
 
         use_self_cond = getattr(self._model_cfg(), "use_self_cond", False)
         use_ads_ref = getattr(self._model_cfg(), "use_ads_ref_pos", False)
+        langevin_force_model = self._get_langevin_force_model()
         state = {"prev_pred": None}
 
         def model_forward(x_t, t):
@@ -829,6 +1332,14 @@ class AdsorbGenModule(L.LightningModule):
                 extra["prev_pred"] = state["prev_pred"]
             if use_ads_ref:
                 extra["ads_ref_pos"] = batch["ads_ref_pos"]
+            if langevin_force_model is not None:
+                extra["mlip_force"] = langevin_force_model(
+                    x_t.detach(),
+                    batch["cell"],
+                    batch["atomic_numbers"],
+                    batch["pad_mask"],
+                )
+                extra["langevin_prediction_type"] = self.flow_cfg.prediction_type
             out = self.model(
                 pos=batch["pos"], x_t=x_t, t=t,
                 atomic_numbers=batch["atomic_numbers"], tags=batch["tags"],
@@ -836,9 +1347,10 @@ class AdsorbGenModule(L.LightningModule):
                 cell=batch["cell"],
                 **extra,
             )
+            out_main = out["pred_x1"] if isinstance(out, dict) else out
             if use_self_cond:
-                state["prev_pred"] = out.detach()
-            return out
+                state["prev_pred"] = out_main.detach()
+            return out_main
 
         x_out = euler_sample(
             model_forward, batch["pos"],
@@ -897,6 +1409,12 @@ class AdsorbGenDataModule(L.LightningDataModule):
                 interstitial_gap=getattr(a, "interstitial_gap", 0.1),
                 provide_ads_ref_pos=provide_ref,
                 skip_anomaly=not include_anomaly,
+                slab_source=getattr(a, "slab_source", "initial"),
+                pristine_slabs=getattr(a, "pristine_slabs", ""),
+                pristine_index=getattr(a, "pristine_sid_index", ""),
+                require_preprocess_shift=getattr(a, "require_preprocess_shift", False),
+                gaussian_ads_stats=getattr(a, "gaussian_ads_stats", ""),
+                gaussian_ads_std_scale=getattr(a, "gaussian_ads_std_scale", 1.0),
             )
             for p in train_paths
         ]
@@ -926,6 +1444,8 @@ class AdsorbGenDataModule(L.LightningDataModule):
         self.val_datasets: list = []
         self.val_names: list = []
         if a.val_lmdb:
+            val_pristine_slabs = getattr(a, "val_pristine_slabs", "") or getattr(a, "pristine_slabs", "")
+            val_pristine_index = getattr(a, "val_pristine_sid_index", "") or getattr(a, "pristine_sid_index", "")
             self.val_datasets.append(PlacementPriorDataset(
                 a.val_lmdb,
                 max_samples=a.max_val_samples,
@@ -934,6 +1454,12 @@ class AdsorbGenDataModule(L.LightningDataModule):
                 prior_mode=getattr(a, "prior_mode", "random_heuristic"),
                 interstitial_gap=getattr(a, "interstitial_gap", 0.1),
                 provide_ads_ref_pos=provide_ref,
+                slab_source=getattr(a, "slab_source", "initial"),
+                pristine_slabs=val_pristine_slabs,
+                pristine_index=val_pristine_index,
+                require_preprocess_shift=getattr(a, "require_preprocess_shift", False),
+                gaussian_ads_stats=getattr(a, "gaussian_ads_stats", ""),
+                gaussian_ads_std_scale=getattr(a, "gaussian_ads_std_scale", 1.0),
             ))
             self.val_names.append("dense")
         is2re_path = getattr(a, "val_lmdb_is2re", None)
@@ -945,6 +1471,12 @@ class AdsorbGenDataModule(L.LightningDataModule):
                 prior_mode=getattr(a, "prior_mode", "random_heuristic"),
                 interstitial_gap=getattr(a, "interstitial_gap", 0.1),
                 provide_ads_ref_pos=provide_ref,
+                slab_source=getattr(a, "slab_source", "initial"),
+                pristine_slabs=getattr(a, "pristine_slabs", ""),
+                pristine_index=getattr(a, "pristine_sid_index", ""),
+                require_preprocess_shift=getattr(a, "require_preprocess_shift", False),
+                gaussian_ads_stats=getattr(a, "gaussian_ads_stats", ""),
+                gaussian_ads_std_scale=getattr(a, "gaussian_ads_std_scale", 1.0),
             ))
             self.val_names.append("is2re")
         val_replicate = int(getattr(a, "val_replicate", 1) or 1)
@@ -1013,7 +1545,20 @@ def build_config(args):
                         f"variant {args.variant!r} sets unknown v1 field {k!r}"
                     )
                 setattr(cfg, k, v)
+        if getattr(args, "use_langevin_param", False):
+            cfg.use_langevin_param = True
+            cfg.langevin_force_clip = float(args.langevin_force_clip)
+            cfg.langevin_eval_on = str(args.langevin_eval_on)
+            cfg.langevin_scale_mode = str(args.langevin_scale_mode)
+            cfg.langevin_use_ads_specific_head = bool(args.langevin_use_ads_specific_head)
+        if getattr(args, "use_si_denoiser", False) or float(getattr(args, "si_denoiser_loss_weight", 0.0)) != 0.0:
+            cfg.use_si_denoiser = True
+            cfg.si_denoiser_use_ads_specific_head = bool(args.si_denoiser_use_ads_specific_head)
         return cfg
+    if getattr(args, "use_langevin_param", False):
+        raise ValueError("Langevin parametrization is implemented for arch='v1' only")
+    if getattr(args, "use_si_denoiser", False) or float(getattr(args, "si_denoiser_loss_weight", 0.0)) != 0.0:
+        raise ValueError("OMatG-style SI denoiser is implemented for arch='v1' only")
     cfg = DiTDenoiserV2Config(
         dim=args.dim,
         pair_dim=args.pair_dim,
@@ -1138,11 +1683,22 @@ def main():
                        "random", "heuristic", "random_heuristic",
                        "harmonic_uniform", "harmonic_centered",
                        "catflow_center_rel",
+                       "gaussian_ads_train_stats",
                    ],
                    default="random_heuristic",
                    help="Placement prior for x_0: fairchem placement mode or custom ads prior")
+    p.add_argument("--slab-source", choices=["initial", "pristine_relaxed"], default="initial",
+                   help="Slab coordinates used in x_0 before adsorbate placement. "
+                        "'initial' keeps the LMDB initial slab; 'pristine_relaxed' "
+                        "uses bare-slab relaxed positions from --pristine-slabs.")
+    p.add_argument("--require-preprocess-shift", action="store_true",
+                   help="Fail if slab_source=pristine_relaxed sees an LMDB entry without preprocess_shift.")
     p.add_argument("--interstitial-gap", type=float, default=0.1,
                    help="fairchem placement interstitial gap (Å)")
+    p.add_argument("--gaussian-ads-stats", type=str, default="",
+                   help="NPZ with mean/std arrays for prior_mode=gaussian_ads_train_stats")
+    p.add_argument("--gaussian-ads-std-scale", type=float, default=1.0,
+                   help="Scale multiplier for gaussian_ads_train_stats std")
     p.add_argument("--variant", type=str, default="v2",
                    help=f"named architecture variant; one of {list_variants()}")
     p.add_argument("--arch", choices=["v1", "v2"], default="v2",
@@ -1162,6 +1718,8 @@ def main():
                    help="extra multiplier slope for t>0.5: 1 + value * relu(t - 0.5)")
     p.add_argument("--ads-pair-l1-weight", type=float, default=0.0,
                    help="auxiliary L1 weight for all adsorbate-internal pair distances")
+    p.add_argument("--movable-pair-l1-weight", type=float, default=0.0,
+                   help="auxiliary L1 weight for all movable atom pair distances")
     p.add_argument("--ads-bond-l1-weight", type=float, default=0.0,
                    help="auxiliary L1 weight for bonded adsorbate-internal pair distances")
     p.add_argument("--ads-nonbonded-clash-weight", type=float, default=0.0,
@@ -1184,6 +1742,11 @@ def main():
                    choices=["x1", "v"],
                    help="x1: model predicts x_1 (default). v: model predicts "
                         "v = x_1 - x_0 (constant velocity field under linear flow).")
+    p.add_argument("--loss-target", type=str, default="auto",
+                   choices=["auto", "x1", "v"],
+                   help="Training loss target. auto preserves the existing behavior "
+                        "and follows --prediction-type. Use --prediction-type x1 "
+                        "--loss-target v for x1 output with pure velocity loss.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gamma-schedule",
                    choices=["none", "sqrt_t1mt", "linear_1mt"],
@@ -1192,6 +1755,38 @@ def main():
                         "sqrt_t1mt = σ·√(t(1-t)) (recommended, zero at both ends).")
     p.add_argument("--gamma-sigma", type=float, default=0.0,
                    help="Noise scale σ. 0 disables (pure deterministic interpolant).")
+    p.add_argument("--train-time-sampling", choices=["uniform", "beta"],
+                   default="uniform",
+                   help="Distribution used to sample training interpolation time t.")
+    p.add_argument("--train-time-beta-alpha", type=float, default=2.0,
+                   help="Alpha parameter for --train-time-sampling beta.")
+    p.add_argument("--train-time-beta-beta", type=float, default=1.0,
+                   help="Beta parameter for --train-time-sampling beta.")
+    p.add_argument("--use-si-denoiser", action="store_true",
+                   help="Add an OMatG-style eta denoiser head for SI SDE sampling.")
+    p.add_argument("--si-denoiser-loss-weight", type=float, default=0.0,
+                   help="Weight for eta denoiser loss. 0 leaves the head untrained.")
+    p.add_argument("--si-denoiser-mask", choices=["movable", "adsorbate"],
+                   default="movable",
+                   help="Atoms used for eta denoiser loss.")
+    p.add_argument("--si-denoiser-use-ads-specific-head", action="store_true",
+                   help="Use a separate adsorbate eta head for the SI denoiser.")
+    p.add_argument("--use-langevin-param", action="store_true",
+                   help="Enable LP: pred_x1 += (1-t)*lambda(t)*detached_UMA_force(x_t).")
+    p.add_argument("--langevin-uma-model", type=str, default="uma-s-1p2",
+                   help="fairchem pretrained model id for LP force input.")
+    p.add_argument("--langevin-uma-task", type=str, default="oc20",
+                   help="fairchem task name for LP force input.")
+    p.add_argument("--langevin-force-clip", type=float, default=100.0,
+                   help="Per-component force clip before LP scaling; <=0 disables clipping.")
+    p.add_argument("--langevin-eval-on", choices=["x_t", "x1_pred"], default="x_t",
+                   help="Position where LP force is evaluated. Only x_t is implemented.")
+    p.add_argument("--langevin-scale-mode", choices=["global", "atom", "vector"],
+                   default="global",
+                   help="LP lambda shape: global=[B,1,1], atom=[B,N,1], "
+                        "vector=[B,N,3].")
+    p.add_argument("--langevin-use-ads-specific-head", action="store_true",
+                   help="Use separate surface/adsorbate heads for atom/vector LP lambda.")
     p.add_argument("--init-from-ckpt", type=str, default="",
                    help="Load model weights from this ckpt (fresh optimizer/epoch). "
                         "Use for finetuning without auto-resuming epoch counter or "
@@ -1201,6 +1796,18 @@ def main():
     p.add_argument("--sample-eval-every-epochs", type=int, default=0)
     p.add_argument("--sample-eval-max-samples", type=int, default=64)
     p.add_argument("--sample-eval-steps", type=int, default=10)
+    p.add_argument("--sample-eval-energy-cover-dir", type=str, default="",
+                   help="Optional OC20-Dense cover dir with gt_results/global_minima.json. "
+                        "When set, sample_eval logs UMA single-point E_sys(pred) - "
+                        "global-min E_sys reference.")
+    p.add_argument("--sample-eval-energy-uma-model", type=str, default="uma-s-1p1",
+                   help="fairchem pretrained model id for sample_eval single-point energy.")
+    p.add_argument("--sample-eval-energy-uma-task", type=str, default="oc20",
+                   help="fairchem task name for sample_eval single-point energy.")
+    p.add_argument("--sample-eval-energy-batch-size", type=int, default=32,
+                   help="chunk size for sample_eval single-point UMA energy.")
+    p.add_argument("--sample-eval-energy-success-margin", type=float, default=0.1,
+                   help="success threshold in eV for E_sys(pred)-E_sys(ref).")
     p.add_argument("--pristine-slabs", type=str, default="",
                    help="path to pristine relaxed-slab pkl (sid->slab_key->pos). "
                         "When set, sample_eval uses pristine pos as final_slab "
@@ -1210,6 +1817,13 @@ def main():
                    help="sid/system_key->slab_key index pkl. Defaults to "
                         "<pristine-slabs>.sid_index.pkl or "
                         "<pristine-slabs>.system_index.pkl")
+    p.add_argument("--val-pristine-slabs", type=str, default="",
+                   help="Optional pristine relaxed-slab pkl for the primary validation LMDB. "
+                        "Defaults to --pristine-slabs.")
+    p.add_argument("--val-pristine-index", "--val-pristine-sid-index",
+                   dest="val_pristine_sid_index", type=str, default="",
+                   help="Optional sid/system_key index for --val-pristine-slabs. "
+                        "Defaults to --pristine-index.")
 
     # Replay buffer (expert iteration)
     p.add_argument("--use-replay", action="store_true")
@@ -1244,6 +1858,11 @@ def main():
     # Logging
     p.add_argument("--wandb-project", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
+    p.add_argument("--wandb-id", type=str, default=None,
+                   help="W&B run id to resume/log into. Use with --wandb-resume.")
+    p.add_argument("--wandb-resume", type=str, default=None,
+                   choices=["allow", "must", "never"],
+                   help="W&B resume policy when --wandb-id is set.")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--validate-only", action="store_true",
                    help="Load last.ckpt and run a single validation pass; skip training. Errors out if last.ckpt is missing.")
@@ -1283,6 +1902,12 @@ def main():
             "interstitial_gap": _args_d.get("interstitial_gap"),
             "translation_std": _args_d.get("translation_std"),
             "movable_mode": _args_d.get("movable_mode"),
+            "slab_source": _args_d.get("slab_source"),
+            "require_preprocess_shift": _args_d.get("require_preprocess_shift"),
+            "pristine_slabs": _args_d.get("pristine_slabs"),
+            "pristine_sid_index": _args_d.get("pristine_sid_index"),
+            "val_pristine_slabs": _args_d.get("val_pristine_slabs"),
+            "val_pristine_sid_index": _args_d.get("val_pristine_sid_index"),
         },
         "trainer": {
             "epochs": _args_d.get("epochs"),
@@ -1300,6 +1925,7 @@ def main():
             "lddt_cutoff": _args_d.get("lddt_cutoff"),
             "lddt_time_weight": _args_d.get("lddt_time_weight"),
             "ads_pair_l1_weight": _args_d.get("ads_pair_l1_weight"),
+            "movable_pair_l1_weight": _args_d.get("movable_pair_l1_weight"),
             "ads_bond_l1_weight": _args_d.get("ads_bond_l1_weight"),
             "ads_nonbonded_clash_weight": _args_d.get("ads_nonbonded_clash_weight"),
             "ads_bond_factor": _args_d.get("ads_bond_factor"),
@@ -1308,6 +1934,23 @@ def main():
             "ads_rel_pos_loss_weight": _args_d.get("ads_rel_pos_loss_weight"),
             "movable_mode": _args_d.get("movable_mode"),
             "flow_eps": _args_d.get("flow_eps"),
+            "loss_target": _args_d.get("loss_target"),
+            "gamma_schedule": _args_d.get("gamma_schedule"),
+            "gamma_sigma": _args_d.get("gamma_sigma"),
+            "train_time_sampling": _args_d.get("train_time_sampling"),
+            "train_time_beta_alpha": _args_d.get("train_time_beta_alpha"),
+            "train_time_beta_beta": _args_d.get("train_time_beta_beta"),
+            "use_si_denoiser": _args_d.get("use_si_denoiser"),
+            "si_denoiser_loss_weight": _args_d.get("si_denoiser_loss_weight"),
+            "si_denoiser_mask": _args_d.get("si_denoiser_mask"),
+            "si_denoiser_use_ads_specific_head": _args_d.get("si_denoiser_use_ads_specific_head"),
+            "use_langevin_param": _args_d.get("use_langevin_param"),
+            "langevin_uma_model": _args_d.get("langevin_uma_model"),
+            "langevin_uma_task": _args_d.get("langevin_uma_task"),
+            "langevin_force_clip": _args_d.get("langevin_force_clip"),
+            "langevin_eval_on": _args_d.get("langevin_eval_on"),
+            "langevin_scale_mode": _args_d.get("langevin_scale_mode"),
+            "langevin_use_ads_specific_head": _args_d.get("langevin_use_ads_specific_head"),
             "activation_checkpointing": _args_d.get("activation_checkpointing"),
             "seed": _args_d.get("seed"),
         },
@@ -1321,6 +1964,11 @@ def main():
             "every_epochs": _args_d.get("sample_eval_every_epochs"),
             "max_samples": _args_d.get("sample_eval_max_samples"),
             "steps": _args_d.get("sample_eval_steps"),
+            "energy_cover_dir": _args_d.get("sample_eval_energy_cover_dir"),
+            "energy_uma_model": _args_d.get("sample_eval_energy_uma_model"),
+            "energy_uma_task": _args_d.get("sample_eval_energy_uma_task"),
+            "energy_batch_size": _args_d.get("sample_eval_energy_batch_size"),
+            "energy_success_margin": _args_d.get("sample_eval_energy_success_margin"),
         },
         "replay": ({
             "enabled": True,
@@ -1400,14 +2048,23 @@ def main():
         sample_eval_every_epochs=args.sample_eval_every_epochs,
         sample_eval_max_samples=args.sample_eval_max_samples,
         sample_eval_steps=args.sample_eval_steps,
+        sample_eval_energy_cover_dir=args.sample_eval_energy_cover_dir,
+        sample_eval_energy_uma_model=args.sample_eval_energy_uma_model,
+        sample_eval_energy_uma_task=args.sample_eval_energy_uma_task,
+        sample_eval_energy_batch_size=args.sample_eval_energy_batch_size,
+        sample_eval_energy_success_margin=args.sample_eval_energy_success_margin,
         pristine_slabs=args.pristine_slabs,
         pristine_sid_index=args.pristine_sid_index,
+        val_pristine_slabs=args.val_pristine_slabs,
+        val_pristine_sid_index=args.val_pristine_sid_index,
+        slab_source=args.slab_source,
         loss_surf_weight=args.loss_surf_weight,
         loss_ads_weight=args.loss_ads_weight,
         lddt_ads_ads_weight=args.lddt_ads_ads_weight,
         lddt_cutoff=args.lddt_cutoff,
         lddt_time_weight=args.lddt_time_weight,
         ads_pair_l1_weight=args.ads_pair_l1_weight,
+        movable_pair_l1_weight=args.movable_pair_l1_weight,
         ads_bond_l1_weight=args.ads_bond_l1_weight,
         ads_nonbonded_clash_weight=args.ads_nonbonded_clash_weight,
         ads_bond_factor=args.ads_bond_factor,
@@ -1417,6 +2074,16 @@ def main():
         movable_mode=args.movable_mode,
         gamma_schedule=args.gamma_schedule,
         gamma_sigma=args.gamma_sigma,
+        train_time_sampling=args.train_time_sampling,
+        train_time_beta_alpha=args.train_time_beta_alpha,
+        train_time_beta_beta=args.train_time_beta_beta,
+        loss_target=args.loss_target,
+        si_denoiser_loss_weight=args.si_denoiser_loss_weight,
+        si_denoiser_mask=args.si_denoiser_mask,
+        gaussian_ads_stats=args.gaussian_ads_stats,
+        gaussian_ads_std_scale=args.gaussian_ads_std_scale,
+        langevin_uma_model=args.langevin_uma_model,
+        langevin_uma_task=args.langevin_uma_task,
         use_replay=args.use_replay,
         replay_buffer_path=replay_buffer_path,
         replay_gt_index_path=args.replay_gt_index if args.use_replay else "",
@@ -1474,6 +2141,8 @@ def main():
         logger = WandbLogger(
             project=args.wandb_project,
             name=args.wandb_run_name,
+            id=args.wandb_id,
+            resume=args.wandb_resume,
             entity=args.wandb_entity,
             save_dir=str(out_dir),
         )

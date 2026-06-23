@@ -17,6 +17,7 @@ data/
 results/
 runs/
 logs/
+geoopt/runs/
 wandb/
 lightning_logs/
 node_modules/

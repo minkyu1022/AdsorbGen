@@ -50,8 +50,10 @@ def _extract(data_obj, metadata: dict | None = None) -> dict:
     y_relaxed = float(d.get("y_relaxed", 0.0) or 0.0)
 
     movable = ((tags == 1) | (tags == 2)) & (fixed == 0)
+    preprocess_shift = np.zeros((3,), dtype=np.float32)
     if movable.any():
         center = pos[movable].mean(axis=0, keepdims=True).astype(np.float32)
+        preprocess_shift = (-center).reshape(3).astype(np.float32)
         pos = pos - center
         pos_relaxed = pos_relaxed - center
 
@@ -74,6 +76,8 @@ def _extract(data_obj, metadata: dict | None = None) -> dict:
         "y_init": y_init,
         "y_relaxed": y_relaxed,
         "anomaly": anomaly,
+        "preprocess_shift": preprocess_shift,
+        "preprocess_shift_mode": "pos_movable",
     }
 
 

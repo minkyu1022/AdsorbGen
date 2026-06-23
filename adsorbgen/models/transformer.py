@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from adsorbgen.models.pair_rope import PairRoPE3D
+
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """AdaLN modulation: x * (1 + scale) + shift, broadcast over token dim."""
@@ -86,23 +88,34 @@ class MaskedSelfAttention(nn.Module):
     self-attention is used (no pair bias).
     """
 
-    def __init__(self, dim: int, num_heads: int, pair_dim: int = 0):
+    def __init__(self, dim: int, num_heads: int, pair_dim: int = 0, pair_rope_dim: int = 0, pair_rope_base: float = 10.0):
         super().__init__()
         assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.pair_dim = pair_dim
+        self.pair_rope_dim = int(pair_rope_dim)
         self.norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim, bias=True)
         self.proj_g = nn.Linear(dim, dim, bias=False)
         self.proj_o = nn.Linear(dim, dim, bias=False)
+        self.pair_rope = (
+            PairRoPE3D(self.pair_rope_dim, self.head_dim, base=pair_rope_base)
+            if self.pair_rope_dim > 0 else None
+        )
 
         if pair_dim > 0:
             self.pair_norm = nn.LayerNorm(pair_dim)
             self.pair_to_heads = nn.Linear(pair_dim, num_heads, bias=False)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, pair_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+        rope_diff_mic: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, N, D = x.shape
         h = self.num_heads
         d = self.head_dim
@@ -123,6 +136,13 @@ class MaskedSelfAttention(nn.Module):
             pair_logits = pair_logits.permute(0, 3, 1, 2).to(q.dtype)  # (B, H, N, N)
             attn_bias = attn_bias + pair_logits
 
+        if self.pair_rope is not None and rope_diff_mic is not None:
+            cos, sin = self.pair_rope.precompute(rope_diff_mic.to(q.dtype))
+            rd = self.pair_rope.rope_dim
+            rotated = self.pair_rope.score(q, k, cos, sin)
+            base = torch.einsum("bhir,bhjr->bhij", q[..., :rd], k[..., :rd])
+            attn_bias = attn_bias + (rotated - base) * (1.0 / math.sqrt(d))
+
         o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         o = o.transpose(1, 2).reshape(B, N, D)
 
@@ -133,11 +153,26 @@ class MaskedSelfAttention(nn.Module):
 class DiTBlock(nn.Module):
     """DiT block with adaLN-Zero conditioning and optional pair bias."""
 
-    def __init__(self, dim: int, num_heads: int, pair_dim: int = 0, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        pair_dim: int = 0,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        pair_rope_dim: int = 0,
+        pair_rope_base: float = 10.0,
+    ):
         super().__init__()
         self.pair_dim = pair_dim
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.attn = MaskedSelfAttention(dim=dim, num_heads=num_heads, pair_dim=pair_dim)
+        self.attn = MaskedSelfAttention(
+            dim=dim,
+            num_heads=num_heads,
+            pair_dim=pair_dim,
+            pair_rope_dim=pair_rope_dim,
+            pair_rope_base=pair_rope_base,
+        )
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), dropout=dropout)
         self.adaLN_modulation = nn.Sequential(
@@ -159,9 +194,21 @@ class DiTBlock(nn.Module):
         if self.pair_dim > 0:
             nn.init.zeros_(self.attn.pair_to_heads.weight)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor, mask: torch.Tensor, pair_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+        rope_diff_mic: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask, pair_feats)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            mask,
+            pair_feats,
+            rope_diff_mic,
+        )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -178,22 +225,41 @@ class DiT(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
+        pair_rope_dim: int = 0,
+        pair_rope_base: float = 10.0,
     ):
         super().__init__()
         self.activation_checkpointing = activation_checkpointing
         self.layers = nn.ModuleList(
             [
                 DiTBlock(dim=dim, num_heads=num_heads, pair_dim=pair_dim, mlp_ratio=mlp_ratio, dropout=dropout)
+                if int(pair_rope_dim) <= 0 else
+                DiTBlock(
+                    dim=dim,
+                    num_heads=num_heads,
+                    pair_dim=pair_dim,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    pair_rope_dim=pair_rope_dim,
+                    pair_rope_base=pair_rope_base,
+                )
                 for _ in range(depth)
             ]
         )
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor, mask: torch.Tensor, pair_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        mask: torch.Tensor,
+        pair_feats: Optional[torch.Tensor] = None,
+        rope_diff_mic: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         for layer in self.layers:
             if self.activation_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x, c, mask, pair_feats, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(layer, x, c, mask, pair_feats, rope_diff_mic, use_reentrant=False)
             else:
-                x = layer(x, c, mask, pair_feats)
+                x = layer(x, c, mask, pair_feats, rope_diff_mic)
         return x
 
 

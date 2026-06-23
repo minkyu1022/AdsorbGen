@@ -111,6 +111,8 @@ def _passes_anomaly(
 @dataclass
 class ReplayEvalConfig:
     prior_mode: str = "random_heuristic"
+    gaussian_ads_stats: str = ""
+    gaussian_ads_std_scale: float = 1.0
     num_systems: int = 500
     num_placements: int = 3
     flow_steps: int = 50
@@ -201,7 +203,19 @@ def run_replay_eval(
 
     model.eval()
     device = torch.device(cfg.device)
-    use_ads_ref = bool(getattr(_model_cfg(model), "use_ads_ref_pos", False))
+    model_cfg = _model_cfg(model)
+    use_ads_ref = bool(getattr(model_cfg, "use_ads_ref_pos", False))
+    langevin_force_model = None
+    if bool(getattr(model_cfg, "use_langevin_param", False)):
+        if str(getattr(model_cfg, "langevin_eval_on", "x_t")) != "x_t":
+            raise ValueError("Only langevin_eval_on='x_t' is implemented")
+        from adsorbgen.evaluation.energy import UMAForce  # noqa: WPS433
+
+        langevin_force_model = UMAForce(
+            model_name=cfg.uma_model,
+            task_name=cfg.uma_task,
+            device=str(device),
+        )
 
     # --- One UMA wrapper shared across all batches ---
     uma = UMAWrapper.from_checkpoint(
@@ -221,6 +235,8 @@ def run_replay_eval(
         prior_mode=cfg.prior_mode,
         max_samples=n_total,
         provide_ads_ref_pos=use_ads_ref,
+        gaussian_ads_stats=cfg.gaussian_ads_stats,
+        gaussian_ads_std_scale=cfg.gaussian_ads_std_scale,
     )
 
     # --- Build work list: one entry per (eligible sys_idx, k placement) ---
@@ -282,6 +298,14 @@ def run_replay_eval(
             extra = {}
             if use_ads_ref:
                 extra["ads_ref_pos"] = _b["ads_ref_pos"]
+            if langevin_force_model is not None:
+                extra["mlip_force"] = langevin_force_model(
+                    x_t.detach(),
+                    _b["cell"],
+                    _b["atomic_numbers"],
+                    _b["pad_mask"],
+                )
+                extra["langevin_prediction_type"] = flow_cfg.prediction_type
             return model(
                 pos=_b["pos"], x_t=x_t, t=t,
                 atomic_numbers=_b["atomic_numbers"], tags=_b["tags"],

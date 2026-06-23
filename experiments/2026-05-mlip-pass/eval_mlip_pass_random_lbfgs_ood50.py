@@ -204,8 +204,8 @@ def main() -> None:
         success = False
         anomaly = None
         e_ads = float("nan")
-        if not relaxed["converged"] or not np.isfinite(relaxed["E_sys"]):
-            status = "uma_unconverged"
+        if not np.isfinite(relaxed["E_sys"]):
+            status = "uma_nonfinite"
         else:
             e_ads = float(relaxed["E_sys"] - ref["E_slab"] - ref["E_adsorbate"])
             rec = {
@@ -222,6 +222,8 @@ def main() -> None:
             ar = _score_record_anomaly(rec)
             if ar.get("valid_strict"):
                 valid = True
+                if not relaxed["converged"]:
+                    status = "uma_unconverged"
                 success = bool(e_ads - ref["E_ads_ref"] <= args.epsilon_succ)
             else:
                 flags = [

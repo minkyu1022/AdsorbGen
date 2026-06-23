@@ -130,6 +130,24 @@ class DiTDenoiserConfig:
     ads_rel_pos_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
     ads_rel_pos_scale: tuple[float, float, float] = (0.6319, 0.8760, 0.7194)
     ads_rel_output_sum_zero: bool = False
+    # Pair-level 3D RoPE over attention logits. Coordinate representation,
+    # flow target, and losses remain absolute Cartesian.
+    use_pair_rope: bool = False
+    pair_rope_dim: int = 48
+    pair_rope_base: float = 10.0
+    # Langevin parametrization: add learned scaling times detached MLIP force.
+    # scale_mode="global" is one scalar per structure, "atom" is one scalar
+    # per atom, and "vector" is one scalar per atom/xyz component.
+    use_langevin_param: bool = False
+    langevin_force_clip: float = 100.0
+    langevin_eval_on: str = "x_t"
+    langevin_scale_mode: str = "global"
+    langevin_use_ads_specific_head: bool = False
+    # OMatG-style stochastic-interpolant denoiser branch.  When enabled, the
+    # model predicts both the SI velocity/x1 head and eta(t, x_t), the latent
+    # Gaussian noise used in x_t = I(t, x0, x1) + gamma(t) z.
+    use_si_denoiser: bool = False
+    si_denoiser_use_ads_specific_head: bool = False
 
 
 class CellEmbedder(nn.Module):
@@ -293,12 +311,33 @@ class DiTDenoiser(nn.Module):
         # ── Condition embeddings (atom_s) ──
         self.t_embedder = TimestepEmbedder(hidden_dim=atom_s)
         self.cell_embedder = CellEmbedder(hidden_dim=atom_s)
+        if cfg.use_langevin_param:
+            if cfg.langevin_scale_mode not in {"global", "atom", "vector"}:
+                raise ValueError(
+                    "langevin_scale_mode must be one of "
+                    "{'global', 'atom', 'vector'}"
+                )
+            out_dim = 1 if cfg.langevin_scale_mode in {"global", "atom"} else 3
+            self.langevin_scale = nn.Linear(atom_s, out_dim, bias=True)
+            nn.init.zeros_(self.langevin_scale.weight)
+            nn.init.zeros_(self.langevin_scale.bias)
+            if cfg.langevin_use_ads_specific_head:
+                if cfg.langevin_scale_mode == "global":
+                    raise ValueError(
+                        "langevin_use_ads_specific_head requires "
+                        "langevin_scale_mode='atom' or 'vector'"
+                    )
+                self.ads_langevin_scale = nn.Linear(atom_s, out_dim, bias=True)
+                nn.init.zeros_(self.ads_langevin_scale.weight)
+                nn.init.zeros_(self.ads_langevin_scale.bias)
 
         # ── Encoder (atom_s, atom_z) ──
         self.encoder = DiT(
             dim=atom_s, depth=cfg.enc_depth, num_heads=cfg.enc_heads,
             pair_dim=atom_z, mlp_ratio=cfg.mlp_ratio, dropout=cfg.dropout,
             activation_checkpointing=cfg.activation_checkpointing,
+            pair_rope_dim=cfg.pair_rope_dim if cfg.use_pair_rope else 0,
+            pair_rope_base=cfg.pair_rope_base,
         )
 
         # ── Atom -> Token projections ──
@@ -333,6 +372,8 @@ class DiTDenoiser(nn.Module):
             dim=token_s, depth=cfg.trunk_depth, num_heads=cfg.trunk_heads,
             pair_dim=token_z, mlp_ratio=cfg.mlp_ratio, dropout=cfg.dropout,
             activation_checkpointing=cfg.activation_checkpointing,
+            pair_rope_dim=cfg.pair_rope_dim if cfg.use_pair_rope else 0,
+            pair_rope_base=cfg.pair_rope_base,
         )
 
         # ── Token -> Atom projection ──
@@ -349,6 +390,8 @@ class DiTDenoiser(nn.Module):
             dim=atom_s, depth=cfg.dec_depth, num_heads=cfg.dec_heads,
             pair_dim=dec_pair_dim, mlp_ratio=cfg.mlp_ratio, dropout=cfg.dropout,
             activation_checkpointing=cfg.activation_checkpointing,
+            pair_rope_dim=cfg.pair_rope_dim if cfg.use_pair_rope else 0,
+            pair_rope_base=cfg.pair_rope_base,
         )
 
         # ── Output head (zero-init) ──
@@ -367,6 +410,14 @@ class DiTDenoiser(nn.Module):
             nn.init.zeros_(self.ads_center_out.bias)
             nn.init.zeros_(self.ads_rel_pos_out.weight)
             nn.init.zeros_(self.ads_rel_pos_out.bias)
+        if cfg.use_si_denoiser:
+            self.eta_out = nn.Linear(atom_s, 3, bias=True)
+            nn.init.zeros_(self.eta_out.weight)
+            nn.init.zeros_(self.eta_out.bias)
+            if cfg.si_denoiser_use_ads_specific_head:
+                self.ads_eta_out = nn.Linear(atom_s, 3, bias=True)
+                nn.init.zeros_(self.ads_eta_out.weight)
+                nn.init.zeros_(self.ads_eta_out.bias)
 
         self.register_buffer(
             "_coord_mean",
@@ -665,7 +716,10 @@ class DiTDenoiser(nn.Module):
         ads_ref_pos: Optional[torch.Tensor] = None,
         ads_center_t: Optional[torch.Tensor] = None,
         ads_rel_pos_t: Optional[torch.Tensor] = None,
+        mlip_force: Optional[torch.Tensor] = None,
+        langevin_prediction_type: str = "x1",
         return_ads_components: bool = False,
+        return_si_eta: bool = False,
     ) -> torch.Tensor:
         """Predict x_1 (absolute coordinates) directly.
 
@@ -698,6 +752,7 @@ class DiTDenoiser(nn.Module):
         pair_feats = self._build_pair_features(
             pair_pos, atomic_numbers, tags, pad_mask, cell, ads_ref_pos=ads_ref_pos,
         )  # (B, N, N, atom_z)
+        rope_diff_mic = _pair_diff_mic(pair_pos, cell) if self.cfg.use_pair_rope else None
 
         # 1b. Atom-level single→pair enrichment (AtomMOF-style c_to_p_trans_q/k).
         # Uses full tokens (which include x_t via xt_proj), so pair indirectly
@@ -717,7 +772,7 @@ class DiTDenoiser(nn.Module):
         c = self.t_embedder(t)
 
         # 3. Encoder
-        x = self.encoder(tokens, c, pad_mask, pair_feats)  # (B, N, atom_s)
+        x = self.encoder(tokens, c, pad_mask, pair_feats, rope_diff_mic)  # (B, N, atom_s)
 
         # 4. Atom -> Token
         token_single = self.atom_to_token(x)  # (B, N, token_s)
@@ -734,16 +789,16 @@ class DiTDenoiser(nn.Module):
         z = self.trunk_z_mlp(z_init)  # (B, N, N, token_z)
 
         # 6. Trunk
-        x_trunk = self.trunk(s, c_trunk, pad_mask, z)  # (B, N, token_s)
+        x_trunk = self.trunk(s, c_trunk, pad_mask, z, rope_diff_mic)  # (B, N, token_s)
 
         # 7. Token -> Atom (residual)
         x = x + self.token_to_atom(x_trunk)  # (B, N, atom_s)
 
         # 8. Decoder (optionally with atom-level pair bias)
         if self.cfg.dec_pair_bias:
-            x = self.decoder(x, c, pad_mask, pair_feats)  # (B, N, atom_s)
+            x = self.decoder(x, c, pad_mask, pair_feats, rope_diff_mic)  # (B, N, atom_s)
         else:
-            x = self.decoder(x, c, pad_mask)  # (B, N, atom_s)
+            x = self.decoder(x, c, pad_mask, None, rope_diff_mic)  # (B, N, atom_s)
 
         # 9. Output: direct x_1 prediction (AtomMOF-style, zero-init head).
         # Non-movable atoms are forced to pos_0 (their x_1 equals x_0 by
@@ -769,12 +824,55 @@ class DiTDenoiser(nn.Module):
             out = ads_out * ads_mask + out * (1.0 - ads_mask)
 
         movable_f = movable_mask.unsqueeze(-1).to(out.dtype)
+        if self.cfg.use_langevin_param and mlip_force is None:
+            raise ValueError("use_langevin_param=True requires mlip_force")
+        if self.cfg.use_langevin_param and mlip_force is not None:
+            if str(self.cfg.langevin_eval_on) != "x_t":
+                raise ValueError(
+                    "DiTDenoiser currently supports Langevin parametrization "
+                    "only with langevin_eval_on='x_t'"
+                )
+            f = mlip_force.detach().to(device=out.device, dtype=out.dtype)
+            clip = float(self.cfg.langevin_force_clip)
+            if clip > 0.0:
+                f = f.clamp(min=-clip, max=clip)
+            mode = str(self.cfg.langevin_scale_mode)
+            if mode == "global":
+                lam = self.langevin_scale(c).to(out.dtype).view(out.shape[0], 1, 1)
+            elif mode in {"atom", "vector"}:
+                lam = self.langevin_scale(x).to(out.dtype)
+                if self.cfg.langevin_use_ads_specific_head:
+                    ads_mask = (tags == 2).unsqueeze(-1).to(out.dtype)
+                    ads_lam = self.ads_langevin_scale(x).to(out.dtype)
+                    lam = ads_lam * ads_mask + lam * (1.0 - ads_mask)
+            else:
+                raise ValueError(f"Unknown langevin_scale_mode={mode!r}")
+            if str(langevin_prediction_type) == "x1":
+                lp_factor = (1.0 - t).to(out.dtype).view(out.shape[0], 1, 1)
+            elif str(langevin_prediction_type) == "v":
+                lp_factor = torch.ones((out.shape[0], 1, 1), device=out.device, dtype=out.dtype)
+            else:
+                raise ValueError(f"Unknown langevin_prediction_type={langevin_prediction_type!r}")
+            out = out + lp_factor * lam * f * movable_f
         pad_f = pad_mask.unsqueeze(-1).to(out.dtype)
         pred_x_1 = out * movable_f + pos * (1 - movable_f)
         pred_x_1 = pred_x_1 * pad_f
 
         if self.training and not torch.isfinite(pred_x_1).all():
             raise RuntimeError("NaN detected in DiTDenoiser forward")
+        if self.cfg.use_si_denoiser or return_si_eta:
+            eta = self.eta_out(x)
+            if self.cfg.si_denoiser_use_ads_specific_head:
+                ads_mask = (tags == 2).unsqueeze(-1).to(eta.dtype)
+                eta_ads = self.ads_eta_out(x)
+                eta = eta_ads * ads_mask + eta * (1.0 - ads_mask)
+            eta = eta * movable_f * pad_f
+            if self.training and not torch.isfinite(eta).all():
+                raise RuntimeError("NaN detected in DiTDenoiser eta forward")
+            out_dict = {"pred_x1": pred_x_1, "eta": eta}
+            if return_ads_components and self.cfg.use_ads_center_rel_head:
+                out_dict.update({"ads_center": ads_center, "ads_rel_pos": ads_rel})
+            return out_dict
         if return_ads_components and self.cfg.use_ads_center_rel_head:
             return {
                 "pred_x1": pred_x_1,

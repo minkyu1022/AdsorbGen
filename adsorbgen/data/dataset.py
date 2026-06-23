@@ -54,6 +54,7 @@ DEFAULT_ADSORBATES_PKL = os.environ.get(
 # Process-wide cache for fairchem adsorbates.pkl reference geometries.
 # Each entry: {ads_id: (numbers (M,) int64, centered_pos (M, 3) float32)}.
 _ADS_DB_CACHE: Optional[dict] = None
+_PRISTINE_SLAB_CACHE: dict[str, tuple[dict, dict, dict]] = {}
 
 
 def load_ads_ref_db(adsorbates_pkl: str) -> dict:
@@ -76,6 +77,80 @@ def load_ads_ref_db(adsorbates_pkl: str) -> dict:
         out[int(k)] = (nums, pos)
     _ADS_DB_CACHE = out
     return out
+
+
+def _split_pristine_index(index: dict) -> tuple[dict, dict]:
+    sid_to_key = {}
+    system_to_key = {}
+    for k, v in index.items():
+        if isinstance(k, (int, np.integer)):
+            sid_to_key[int(k)] = v
+        elif isinstance(k, str) and k.lstrip("-").isdigit():
+            sid_to_key[int(k)] = v
+        else:
+            system_to_key[str(k)] = v
+    return sid_to_key, system_to_key
+
+
+def load_pristine_slab_db(pristine_slabs: str, pristine_index: str = "") -> tuple[dict, dict, dict]:
+    """Load bare-slab relaxed positions and sid/system indexes.
+
+    Returned records may come from different extraction scripts; position is
+    read later from ``pos_relaxed`` first, then ``pos`` for compatibility.
+    """
+    pristine_slabs = str(pristine_slabs or "")
+    if not pristine_slabs:
+        return {}, {}, {}
+    pristine_index = str(pristine_index or "")
+    key = f"{pristine_slabs}\n{pristine_index}"
+    cached = _PRISTINE_SLAB_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with open(pristine_slabs, "rb") as f:
+        db = pickle.load(f)
+    sid_to_key = {}
+    system_to_key = {}
+    if pristine_index:
+        with open(pristine_index, "rb") as f:
+            sid_to_key, system_to_key = _split_pristine_index(pickle.load(f))
+    out = (db, sid_to_key, system_to_key)
+    _PRISTINE_SLAB_CACHE[key] = out
+    return out
+
+
+def _pristine_slab_pos_from_record(rec) -> Optional[np.ndarray]:
+    if rec is None:
+        return None
+    if isinstance(rec, dict):
+        rec = rec.get("pos_relaxed", rec.get("pos"))
+    if rec is None:
+        return None
+    return np.asarray(rec, dtype=np.float32)
+
+
+def lookup_pristine_slab_pos(
+    db: dict,
+    sid_to_key: dict,
+    system_to_key: dict,
+    sid: int,
+    system_key=None,
+) -> Optional[np.ndarray]:
+    if not db:
+        return None
+    if sid_to_key and sid is not None and int(sid) >= 0:
+        key = sid_to_key.get(int(sid))
+        pos = _pristine_slab_pos_from_record(db.get(key)) if key is not None else None
+        if pos is not None:
+            return pos
+    if system_key is not None:
+        sk = str(system_key)
+        if system_to_key:
+            key = system_to_key.get(sk)
+            pos = _pristine_slab_pos_from_record(db.get(key)) if key is not None else None
+            if pos is not None:
+                return pos
+        return _pristine_slab_pos_from_record(db.get(sk))
+    return None
 
 
 def _ads_ref_pos_for_sample(
@@ -312,6 +387,7 @@ _PRIOR_MODE_MAP = {
 }
 
 _CUSTOM_PRIOR_MODES = {
+    "gaussian_ads_train_stats",
     "harmonic_uniform",
     "harmonic_centered",
     "catflow_center_rel",
@@ -321,6 +397,24 @@ _CATFLOW_ADS_CENTER_MEAN = np.asarray([-0.4249, -0.0863, 5.8592], dtype=np.float
 _CATFLOW_ADS_CENTER_STD = np.asarray([2.9450, 3.2665, 1.7597], dtype=np.float32)
 _CATFLOW_ADS_REL_POS_MEAN = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
 _CATFLOW_ADS_REL_POS_STD = np.asarray([0.6319, 0.8760, 0.7194], dtype=np.float32)
+_GAUSSIAN_ADS_STATS_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def load_gaussian_ads_stats(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load adsorbate Cartesian Gaussian stats from an ``.npz`` file."""
+    path = str(path or "")
+    if not path:
+        raise ValueError("gaussian_ads_train_stats prior requires gaussian_ads_stats")
+    cached = _GAUSSIAN_ADS_STATS_CACHE.get(path)
+    if cached is not None:
+        return cached
+    data = np.load(path)
+    mean = np.asarray(data["mean"], dtype=np.float32).reshape(3)
+    std = np.asarray(data["std"], dtype=np.float32).reshape(3)
+    std = np.maximum(std, np.float32(1e-6))
+    out = (mean, std)
+    _GAUSSIAN_ADS_STATS_CACHE[path] = out
+    return out
 
 
 class PlacementPriorDataset(PreprocessedDisplacementDataset):
@@ -346,9 +440,15 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         interstitial_gap: float = 0.1,
         adsorbates_pkl: str = DEFAULT_ADSORBATES_PKL,
         on_failure: str = "fallback",
+        slab_source: str = "initial",
+        pristine_slabs: str = "",
+        pristine_index: str = "",
+        require_preprocess_shift: bool = False,
+        gaussian_ads_stats: str = "",
+        gaussian_ads_std_scale: float = 1.0,
         **base_kwargs,
     ):
-        super().__init__(lmdb_path, **base_kwargs)
+        super().__init__(lmdb_path, adsorbates_pkl=adsorbates_pkl, **base_kwargs)
         if prior_mode not in _PRIOR_MODE_MAP and prior_mode not in _CUSTOM_PRIOR_MODES:
             raise ValueError(
                 f"prior_mode must be one of {list(_PRIOR_MODE_MAP) + sorted(_CUSTOM_PRIOR_MODES)}, "
@@ -361,14 +461,85 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         if on_failure not in ("fallback", "raise"):
             raise ValueError(f"on_failure must be 'fallback' or 'raise'")
         self.on_failure = on_failure
+        if slab_source not in ("initial", "pristine_relaxed"):
+            raise ValueError("slab_source must be 'initial' or 'pristine_relaxed'")
+        self.slab_source = str(slab_source)
+        self.pristine_slabs = str(pristine_slabs or "")
+        self.pristine_index = str(pristine_index or "")
+        self.require_preprocess_shift = bool(require_preprocess_shift)
+        self.gaussian_ads_stats = str(gaussian_ads_stats or "")
+        self.gaussian_ads_std_scale = float(gaussian_ads_std_scale)
+        if self.slab_source == "pristine_relaxed" and not self.pristine_slabs:
+            raise ValueError("slab_source='pristine_relaxed' requires pristine_slabs")
+        if self.prior_mode == "gaussian_ads_train_stats":
+            load_gaussian_ads_stats(self.gaussian_ads_stats)
 
         self._ads_db = None
+        self._pristine_db = None
+        self._pristine_sid_to_key = None
+        self._pristine_system_to_key = None
         self._n_fallbacks = 0
 
     def _ensure_ads_db(self):
         if self._ads_db is None:
             with open(self.adsorbates_pkl, "rb") as f:
                 self._ads_db = pickle.load(f)
+
+    def _ensure_pristine_db(self):
+        if self.slab_source != "pristine_relaxed":
+            return
+        if self._pristine_db is None:
+            db, sid_to_key, system_to_key = load_pristine_slab_db(
+                self.pristine_slabs, self.pristine_index,
+            )
+            self._pristine_db = db
+            self._pristine_sid_to_key = sid_to_key
+            self._pristine_system_to_key = system_to_key
+
+    def _apply_pristine_slab_source(self, entry, pos: np.ndarray, tags: np.ndarray) -> np.ndarray:
+        if self.slab_source != "pristine_relaxed":
+            return pos
+        self._ensure_pristine_db()
+        slab_idx = np.where(tags != 2)[0]
+        pristine = lookup_pristine_slab_pos(
+            self._pristine_db or {},
+            self._pristine_sid_to_key or {},
+            self._pristine_system_to_key or {},
+            int(entry.get("sid", -1)),
+            entry.get("system_key", None),
+        )
+        if pristine is None or pristine.shape[0] != slab_idx.size:
+            self._n_fallbacks += 1
+            if self.on_failure == "raise":
+                got = None if pristine is None else pristine.shape
+                raise RuntimeError(
+                    f"pristine slab lookup failed for sid={entry.get('sid')} "
+                    f"system_key={entry.get('system_key')} expected_slab_atoms={slab_idx.size} got={got}"
+                )
+            return pos
+        pos = pos.copy()
+        pristine = pristine.astype(np.float32, copy=False)
+        if "preprocess_shift" in entry:
+            offset = np.asarray(entry["preprocess_shift"], dtype=np.float32).reshape(3)
+        else:
+            if self.require_preprocess_shift:
+                raise RuntimeError(
+                    "slab_source='pristine_relaxed' requires entry['preprocess_shift']; "
+                    "regenerate the LMDB with the updated preprocessing pipeline."
+                )
+            fixed = np.asarray(entry.get("fixed", np.zeros(len(tags))), dtype=np.int64)
+            anchor = tags[slab_idx] == 0
+            if not np.any(anchor):
+                anchor = fixed[slab_idx] == 1
+            if not np.any(anchor):
+                anchor = np.ones(slab_idx.size, dtype=bool)
+            # Fallback for legacy LMDBs that do not store the raw->current shift:
+            # tag==0 bulk atoms are unchanged by adsorbate unwrap and should be
+            # identical between bare-slab and adslab initial frames up to the
+            # preprocessing translation.
+            offset = pos[slab_idx][anchor].mean(axis=0) - pristine[anchor].mean(axis=0)
+        pos[slab_idx] = pristine + offset.astype(np.float32, copy=False)
+        return pos
 
     def _draw_placement(self, entry) -> Optional[np.ndarray]:
         """Return (n_ads, 3) adsorbate positions from a fresh fairchem call.
@@ -392,6 +563,7 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         tags = np.asarray(entry["tags"]).astype(np.int64)
         fixed = np.asarray(entry["fixed"]).astype(np.int64)
         nums = np.asarray(entry["atomic_numbers"]).astype(np.int64)
+        pos = self._apply_pristine_slab_source(entry, np.asarray(pos, dtype=np.float32), tags)
 
         ads_id = int(entry["ads_id"])
         if ads_id < 0:
@@ -490,6 +662,16 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         rel = rel_norm * _CATFLOW_ADS_REL_POS_STD[None, :] + _CATFLOW_ADS_REL_POS_MEAN[None, :]
         return (center[None, :] + rel).astype(np.float32)
 
+    def _draw_gaussian_ads_placement(self, ads_idx: np.ndarray) -> Optional[np.ndarray]:
+        """Adsorbate-only Gaussian x0 using train-set ads Cartesian stats."""
+        n_ads = int(ads_idx.size)
+        if n_ads == 0:
+            return None
+        mean, std = load_gaussian_ads_stats(self.gaussian_ads_stats)
+        scale = np.float32(self.gaussian_ads_std_scale)
+        sample = np.random.randn(n_ads, 3).astype(np.float32)
+        return sample * (std[None, :] * scale) + mean[None, :]
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         self._ensure_env()
         real_idx = int(self._idx_map[idx]) if self._idx_map is not None else int(idx)
@@ -502,8 +684,12 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
         custom_prior = self.prior_mode in _CUSTOM_PRIOR_MODES
         ads_placement = None if custom_prior else self._draw_placement(entry)
 
-        pos = np.asarray(entry["pos"], dtype=np.float32).copy()
         tags_np = np.asarray(entry["tags"]).astype(np.int64)
+        pos = self._apply_pristine_slab_source(
+            entry,
+            np.asarray(entry["pos"], dtype=np.float32).copy(),
+            tags_np,
+        )
         ads_idx_np = np.where(tags_np == 2)[0]
 
         if ads_placement is not None:
@@ -535,6 +721,8 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
                 ads_placement = self._draw_harmonic_placement(
                     pos_t.numpy(), cell_np, tags_np, ads_idx_np,
                 )
+            elif self.prior_mode == "gaussian_ads_train_stats":
+                ads_placement = self._draw_gaussian_ads_placement(ads_idx_np)
             else:
                 ads_placement = self._draw_catflow_center_rel_placement(ads_idx_np)
             if ads_placement is not None:
@@ -563,6 +751,10 @@ class PlacementPriorDataset(PreprocessedDisplacementDataset):
             "ads_id": torch.tensor(int(entry.get("ads_id", -1)), dtype=torch.long),
             "y_relaxed": torch.tensor(float(entry.get("y_relaxed", 0.0)), dtype=torch.float32),
         }
+        if "system_key" in entry:
+            sample["system_key"] = str(entry["system_key"])
+        if "config_key" in entry:
+            sample["config_key"] = str(entry["config_key"])
         if sample["cell"].dim() == 3:
             sample["cell"] = sample["cell"].squeeze(0)
         if self.provide_ads_ref_pos:
